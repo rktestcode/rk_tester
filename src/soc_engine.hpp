@@ -20,6 +20,15 @@ struct CpuTime {
     unsigned long long idle{0};
 };
 
+struct MppStats {
+    double enc_fps{0.0};
+    double dec_fps{0.0};
+    int enc_freq_mhz{0};
+    int dec_freq_mhz{0};
+    uint64_t enc_total{0};
+    uint64_t dec_total{0};
+};
+
 class RkTesterEngine {
 public:
     int num_cores{8};
@@ -34,12 +43,30 @@ public:
     std::atomic<bool> cpu_stress{false};
     std::atomic<bool> gpu_stress{false};
     std::atomic<bool> npu_stress{false};
+    std::atomic<bool> rga_stress{false};
+    std::atomic<bool> mpp_stress{false};
     int target_cpu_cores{8};
     bool governor_perf{false};
+    std::string saved_gpu_gov{"simple_ondemand"};
+    std::string saved_npu_gov{"rknpu_ondemand"};
+    bool gpu_gov_boosted{false};
+    bool npu_gov_boosted{false};
 
     std::vector<std::thread> cpu_threads;
     pid_t gpu_pid{0};
     std::vector<pid_t> npu_pids;
+    pid_t rga_pid{0};
+    pid_t mpp_pid{0};
+
+    // MPP 硬件中断帧率采样基线
+    uint64_t prev_mpp_enc_irqs{0};
+    uint64_t prev_mpp_dec_irqs{0};
+    uint64_t prev_mpp_sample_us{0};
+    uint64_t mpp_base_enc_irqs{0};
+    uint64_t mpp_base_dec_irqs{0};
+    bool mpp_irq_initialized{false};
+    double smooth_mpp_enc_fps{0.0};
+    double smooth_mpp_dec_fps{0.0};
 
     // 4 路千兆网卡 EMC 丢包监测引擎
     NetEmcTester net_emc;
@@ -73,6 +100,8 @@ public:
     void toggle_cpu_stress();
     std::string toggle_gpu_stress();
     std::string toggle_npu_stress();
+    std::string toggle_rga_stress();
+    std::string toggle_mpp_stress();
     std::string toggle_all_stress();
     std::string check_stress_health();
     void stop_all_stress();
@@ -82,6 +111,9 @@ public:
     std::vector<int> get_cpu_freqs() const;
     std::pair<double, int> get_gpu_stats() const;
     std::pair<std::vector<double>, int> get_npu_stats() const;
+    std::pair<std::vector<double>, int> get_rga_stats() const;
+    MppStats get_mpp_stats();
+    std::pair<uint64_t, uint64_t> get_mpp_session_frames() const;
     std::map<std::string, double> get_thermals() const;
     std::tuple<double, double, double> get_mem_stats() const;
     std::string get_uptime() const;

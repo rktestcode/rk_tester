@@ -36,6 +36,8 @@ SavedConfig load_config(const std::string& path) {
         if (k == "cpu") cfg.cpu = (iv != 0);
         else if (k == "gpu") cfg.gpu = (iv != 0);
         else if (k == "npu") cfg.npu = (iv != 0);
+        else if (k == "rga") cfg.rga = (iv != 0);
+        else if (k == "mpp") cfg.mpp = (iv != 0);
         else if (k == "emc") cfg.emc = (iv != 0);
         else if (k == "rs232") cfg.rs232 = (iv != 0);
         else if (k == "rs485") cfg.rs485 = (iv != 0);
@@ -62,6 +64,8 @@ bool save_config_snapshot(const std::string& path, const SavedConfig& cfg) {
       << "cpu=" << (cfg.cpu ? 1 : 0) << "\n"
       << "gpu=" << (cfg.gpu ? 1 : 0) << "\n"
       << "npu=" << (cfg.npu ? 1 : 0) << "\n"
+      << "rga=" << (cfg.rga ? 1 : 0) << "\n"
+      << "mpp=" << (cfg.mpp ? 1 : 0) << "\n"
       << "emc=" << (cfg.emc ? 1 : 0) << "\n"
       << "rs232=" << (cfg.rs232 ? 1 : 0) << "\n"
       << "rs485=" << (cfg.rs485 ? 1 : 0) << "\n"
@@ -90,6 +94,8 @@ void save_engine_config(const RkTesterEngine& engine, const std::string& path) {
     cfg.cpu = engine.cpu_stress.load();
     cfg.gpu = engine.gpu_stress.load();
     cfg.npu = engine.npu_stress.load();
+    cfg.rga = engine.rga_stress.load();
+    cfg.mpp = engine.mpp_stress.load();
     cfg.emc = engine.net_emc.active.load();
     cfg.rs232 = engine.rs232.active.load();
     cfg.rs485 = engine.rs485.active.load();

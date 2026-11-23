@@ -31,6 +31,14 @@ int main(int argc, char* argv[]) {
             signal(SIGTERM, sig_handler);
             signal(SIGINT, sig_handler);
             return run_internal_npu_matmul_burn();
+        } else if (arg == "--internal-rga-burn") {
+            signal(SIGTERM, sig_handler);
+            signal(SIGINT, sig_handler);
+            return run_internal_rga_burn();
+        } else if (arg == "--internal-mpp-burn") {
+            signal(SIGTERM, sig_handler);
+            signal(SIGINT, sig_handler);
+            return run_internal_mpp_burn();
         } else if (arg == "-h" || arg == "--help") {
             print_usage();
             return 0;
@@ -112,14 +120,15 @@ int main(int argc, char* argv[]) {
         ui.sync_menu_from_config(saved_cfg);
         ui.apply_menu(engine);
         int active_cnt = (engine.cpu_stress.load() ? 1 : 0) + (engine.gpu_stress.load() ? 1 : 0) +
-                         (engine.npu_stress.load() ? 1 : 0) + (engine.net_emc.active.load() ? 1 : 0) +
+                         (engine.npu_stress.load() ? 1 : 0) + (engine.rga_stress.load() ? 1 : 0) +
+                         (engine.mpp_stress.load() ? 1 : 0) + (engine.net_emc.active.load() ? 1 : 0) +
                          (engine.rs232.active.load() ? 1 : 0) + (engine.rs485.active.load() ? 1 : 0) +
                          (engine.usb_tester.active.load() ? 1 : 0) + (engine.can_tester.active.load() ? 1 : 0);
         if (ui.prompt_status.find("unavailable") == std::string::npos) {
             ui.prompt_status = "Restored last selection: " + std::to_string(active_cnt) + " active (" + cfg_path + ").";
         }
     } else {
-        ui.prompt_status = "Ready. Press [M] Menu, [5] LAN-Ping, [6] 232, [7] 485, [8] USB, [9] CAN, [Q] Quit.";
+        ui.prompt_status = "Ready. Press [M] Menu, [1-4,0,V] SoC, [5] LAN, [6] 232, [7] 485, [8] USB, [9] CAN.";
     }
 
     run_tui_loop(engine, ui);

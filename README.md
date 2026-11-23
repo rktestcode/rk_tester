@@ -1,6 +1,6 @@
 # RK3576 Unified Hardware Test Platform (rk_tester)
 
-专为 Rockchip RK3576 4路千兆网卡开发板打造的**一站式全功能终端测试工具**（全 ASCII/英文界面，彻底杜绝任何终端乱码与方块字问题）。集成四路网卡静态 IP 自动配置与链路监控、四路网口高频两两互 Ping 丢包监测（EMC/ESD/EFT抗扰度测试）、RS232/RS485 两两对接持续单向数据传输测试、双路 CAN 总线测试、4路 USB 存储设备并发读写校验压测，以及 CPU/GPU/NPU 全负荷硬件烤机于一体。
+专为 Rockchip RK3576 4路千兆网卡开发板打造的**一站式全功能终端测试工具**（全 ASCII/英文界面，彻底杜绝任何终端乱码与方块字问题）。集成四路网卡静态 IP 自动配置与链路监控、四路网口高频两两互 Ping 丢包监测（EMC/ESD/EFT抗扰度测试）、RS232/RS485 两两对接持续单向数据传输测试、双路 CAN 总线测试、4路 USB 存储设备并发读写校验压测，以及 CPU/GPU/NPU/RGA/RKMPP 全负荷硬件烤机于一体。
 
 ---
 
@@ -87,7 +87,7 @@
 ## 五、四大独立硬件功能板块与高对比度仪表盘布局
 
 仪表盘按硬件功能域划分为 **4 个独立板块**，配高对比度彩色实体徽标栏与动态自适应布局：
-1. **【板块 1：计算加速与 SoC 监控】`[1..3] COMPUTE & SOC ACCELERATORS`（青底黑字）**：CPU 8 核（4×A53 + 4×A72）负载与主频、Mali-G52 GPU 离屏压测、RK-NPU 双核 6 TOPS 推理压测、内存占用与 SoC/Big/GPU/NPU 温度。
+1. **【板块 1：计算加速与 SoC 监控】`[1-4,0,V] COMPUTE & SOC ACCELERATORS`（青底黑字）**：CPU 8 核（4×A53 + 4×A72）负载与主频、Mali-G52 GPU OpenCL 压测、RK-NPU 双核 6 TOPS 矩阵压测、RGA2 双核 4K 2D CSC/旋转压测、RKMPP 双通道 4K H.265 VENC+VDEC 编解码回环压测、内存占用与 SoC/Big/GPU/NPU 温度。
 2. **【板块 2：四路千兆以太网与 EMC 监测】`[5] 4-PORT GIGABIT ETHERNET`（绿底黑字）**：4 路网口物理链路状态、速率、发包/收包/丢包率、微秒级 RTT、EMC 综合评级与事件流水。
 3. **【板块 3：工业现场总线测试】`[6,7,9] INDUSTRIAL FIELDBUS`（黄底黑字）**：RS232、RS485 与 CAN 总线实时速率、帧率、错误计数与状态标签。
 4. **【板块 4：高速 USB 存储读写压测】`[8] 4-PORT USB STORAGE`（蓝底白字）**：总读写量与速率汇总 + 4 路独立盘体实时状态。
@@ -100,7 +100,7 @@
 随时按 **`M`** 或使用 `sudo rk_tester -m` 启动即可呼出交互式勾选菜单：
 - **`↑` / `↓` / `←` / `→`**：移动光标选择测试项、网口过滤项或操作按钮。
 - **`Space` / `Enter`**：切换勾选状态 `[X]` / `[ ]`。
-- **`1..9`**：快速切换对应测试项（`4` 快速切换 CPU+GPU+NPU 全烤机）。
+- **`0..9` / `V`**：快速切换对应测试项（`0`=RGA，`V`=RKMPP，`4` 快速切换 CPU+GPU+NPU+RGA+RKMPP 五引擎全烤机）。
 - **`Z` / `X` / `D`**：分别切换 RS232 / RS485 / CAN 传输方向（光标停在 RS232 或 RS485 上时按 `D` 也可直接切换该项方向）。
 - **`A` / `N`**：一键全选 / 全清。
 - **`S`** 或选中 `[ Apply & Run ]` 回车：应用勾选配置并自动保存至 `/etc/rk_tester.conf`（下次启动自动记住上次选择）。
@@ -124,10 +124,12 @@
 | 按键 | 功能说明 |
 | :---: | :--- |
 | **`M`** | **呼出测试项交互式勾选配置菜单** |
-| **`1`** | **开启 / 停止 CPU 8 核高压计算压测** |
-| **`2`** | **开启 / 停止 Mali-G52 GPU 满频离屏压测** |
-| **`3`** | **开启 / 停止 RKNPU 双核 6 TOPS 神经网络推理压测** |
-| **`4`** | **一键全烤机（同时切换 CPU + GPU + NPU 全负荷）** |
+| **`1`** | **开启 / 停止 CPU 8 核 ARM NEON SIMD 满发射 + DDR 带宽混合压测** |
+| **`2`** | **开启 / 停止 Mali-G52 GPU 满频（900MHz）OpenCL 压测** |
+| **`3`** | **开启 / 停止 RKNPU 双核 6 TOPS 满频（950MHz）MatMul 压测** |
+| **`0`** | **开启 / 停止 RGA2 双核 4K 2D CSC+旋转压测（DMA-BUF 零拷贝）** |
+| **`V`** | **开启 / 停止 RKMPP 双通道 4K H.265 VENC+VDEC 硬件编解码回环压测** |
+| **`4`** | **一键全烤机（同时切换 CPU + GPU + NPU + RGA + RKMPP 全负荷）** |
 | **`5`** | **开启 / 暂停 4-LAN 两两互 Ping 丢包监测（100ms 周期）** |
 | **`6`** | **开启 / 暂停 RS232 串口传输测试（ttyS0 / ttyS1）** |
 | **`7`** | **开启 / 暂停 RS485 串口传输测试（ttyS2 / ttyS3）** |
@@ -149,12 +151,12 @@
 ```text
 src/
 ├── common.{hpp,cpp}        # 公共常量、信号退出标志、校验和与工具函数
-├── accel_burn.{hpp,cpp}    # 内置 GPU (Mali OpenCL) & NPU (RKNPU 双核 MatMul) 原生压测工作进程
+├── accel_burn.{hpp,cpp}    # 内置 GPU (OpenCL) / NPU (RKNN) / RGA (IM2D) / RKMPP (H.265 编解码) 原生压测工作进程
 ├── serial_tester.{hpp,cpp} # RS232 / RS485 收发校验引擎
 ├── can_tester.{hpp,cpp}    # SocketCAN 收发校验与总线错误监控引擎
 ├── usb_tester.{hpp,cpp}    # 4 路 USB 存储自动挂载、漂移恢复与读写校验引擎
 ├── net_emc.{hpp,cpp}       # 4 路千兆网卡 AF_PACKET 互 Ping 与 EMC 监测引擎
-├── soc_engine.{hpp,cpp}    # SoC 监控与 CPU/GPU/NPU 压测调度总控
+├── soc_engine.{hpp,cpp}    # SoC 监控与 CPU/GPU/NPU/RGA/RKMPP 压测调度总控
 ├── config_store.{hpp,cpp}  # 测试配置持久化 (/etc/rk_tester.conf)
 ├── tui.{hpp,cpp}           # ncurses 仪表盘、勾选菜单与退出汇总报告
 └── main.cpp                # CLI 参数解析与程序主入口

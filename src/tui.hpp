@@ -15,6 +15,11 @@ struct UiState {
     int gpu_freq{0};
     std::vector<double> npu_loads{0.0, 0.0};
     int npu_freq{0};
+    std::vector<double> rga_loads{0.0, 0.0};
+    int rga_freq{0};
+    double mpp_enc_fps{0.0};
+    double mpp_dec_fps{0.0};
+    int mpp_freq{0};
     double used_ram{0.0};
     double tot_ram{0.0};
     double ram_pct{0.0};
@@ -27,6 +32,8 @@ struct UiState {
     bool menu_cpu{false};
     bool menu_gpu{false};
     bool menu_npu{false};
+    bool menu_rga{false};
+    bool menu_mpp{false};
     bool menu_emc{false};
     bool menu_rs232{false};
     bool menu_rs485{false};

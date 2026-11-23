@@ -13,6 +13,8 @@ struct SavedConfig {
     bool cpu{false};
     bool gpu{false};
     bool npu{false};
+    bool rga{false};
+    bool mpp{false};
     bool emc{false};
     bool rs232{false};
     bool rs485{false};
