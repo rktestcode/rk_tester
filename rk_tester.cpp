@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
@@ -294,23 +295,25 @@ private:
     }
 };
 
+enum class CanDirection {
+    CAN0_TO_CAN1 = 0,   // CAN0 TX -> CAN1 RX (Uni) [Default recommended]
+    CAN1_TO_CAN0 = 1,   // CAN1 TX -> CAN0 RX (Uni)
+    PING_PONG = 2       // CAN0 <-> CAN1 (Ping-Pong Request/Response)
+};
+
 class CanBusTester {
 public:
-    std::string name{"CAN0 <-> CAN1"};
     std::string if0{"can0"};
     std::string if1{"can1"};
     std::atomic<bool> active{false};
+    std::atomic<CanDirection> dir{CanDirection::CAN0_TO_CAN1};
 
-    std::atomic<uint64_t> c0_to_c1_tx{0};
-    std::atomic<uint64_t> c0_to_c1_rx{0};
-    std::atomic<uint64_t> c0_to_c1_err{0};
+    std::atomic<uint64_t> tx_frames{0};
+    std::atomic<uint64_t> rx_frames{0};
+    std::atomic<uint64_t> err_frames{0};
 
-    std::atomic<uint64_t> c1_to_c0_tx{0};
-    std::atomic<uint64_t> c1_to_c0_rx{0};
-    std::atomic<uint64_t> c1_to_c0_err{0};
-
-    std::atomic<double> c0_to_c1_fps{0.0};
-    std::atomic<double> c1_to_c0_fps{0.0};
+    std::atomic<double> tx_fps{0.0};
+    std::atomic<double> rx_fps{0.0};
     std::string status_msg{"STANDBY"};
 
     std::thread worker;
@@ -318,6 +321,35 @@ public:
     CanBusTester() = default;
     ~CanBusTester() {
         stop();
+    }
+
+    void cycle_direction() {
+        int d = (static_cast<int>(dir.load()) + 1) % 3;
+        dir.store(static_cast<CanDirection>(d));
+        reset();
+    }
+
+    void set_direction(CanDirection d) {
+        dir.store(d);
+        reset();
+    }
+
+    std::string get_mode_name() const {
+        switch (dir.load()) {
+            case CanDirection::CAN0_TO_CAN1: return "CAN0 -> CAN1 (Uni)";
+            case CanDirection::CAN1_TO_CAN0: return "CAN1 -> CAN0 (Uni)";
+            case CanDirection::PING_PONG:    return "CAN0 <-> CAN1 (Ping-Pong)";
+        }
+        return "CAN0 -> CAN1 (Uni)";
+    }
+
+    std::string get_short_mode_name() const {
+        switch (dir.load()) {
+            case CanDirection::CAN0_TO_CAN1: return "0->1";
+            case CanDirection::CAN1_TO_CAN0: return "1->0";
+            case CanDirection::PING_PONG:    return "0<->1 PP";
+        }
+        return "0->1";
     }
 
     void start() {
@@ -331,20 +363,17 @@ public:
     void stop() {
         active.store(false);
         if (worker.joinable()) worker.join();
-        c0_to_c1_fps.store(0.0);
-        c1_to_c0_fps.store(0.0);
+        tx_fps.store(0.0);
+        rx_fps.store(0.0);
         status_msg = "STANDBY";
     }
 
     void reset() {
-        c0_to_c1_tx.store(0);
-        c0_to_c1_rx.store(0);
-        c0_to_c1_err.store(0);
-        c1_to_c0_tx.store(0);
-        c1_to_c0_rx.store(0);
-        c1_to_c0_err.store(0);
-        c0_to_c1_fps.store(0.0);
-        c1_to_c0_fps.store(0.0);
+        tx_frames.store(0);
+        rx_frames.store(0);
+        err_frames.store(0);
+        tx_fps.store(0.0);
+        rx_fps.store(0.0);
     }
 
     static void ensure_can_up(const std::string& dev) {
@@ -352,7 +381,12 @@ public:
         std::string state;
         if (f.is_open()) f >> state;
         if (state != "up") {
-            std::string cmd = "ip link set " + dev + " type can bitrate 500000 dbitrate 2000000 fd on 2>/dev/null; ip link set " + dev + " up 2>/dev/null";
+            std::string cmd = "ip link set " + dev + " type can bitrate 500000 dbitrate 2000000 fd on 2>/dev/null; "
+                              "ip link set " + dev + " txqueuelen 1000 2>/dev/null; "
+                              "ip link set " + dev + " up 2>/dev/null";
+            if (system(cmd.c_str()) < 0) {}
+        } else {
+            std::string cmd = "ip link set " + dev + " txqueuelen 1000 2>/dev/null";
             if (system(cmd.c_str()) < 0) {}
         }
     }
@@ -376,6 +410,11 @@ public:
         rfilter[0].can_id = filter_id;
         rfilter[0].can_mask = CAN_SFF_MASK;
         setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter));
+
+        // Flush any stale frames
+        struct can_frame stale;
+        while (read(s, &stale, sizeof(stale)) > 0) {}
+
         return s;
     }
 
@@ -383,8 +422,8 @@ public:
         ensure_can_up(if0);
         ensure_can_up(if1);
 
-        int s0 = open_socket(if0, 0x221); // s0 listens on can0 for frames sent by can1 (0x221)
-        int s1 = open_socket(if1, 0x121); // s1 listens on can1 for frames sent by can0 (0x121)
+        int s0 = open_socket(if0, 0x221); // s0 listens on can0 for 0x221
+        int s1 = open_socket(if1, 0x121); // s1 listens on can1 for 0x121
 
         if (s0 < 0 || s1 < 0) {
             status_msg = "CAN_ERR: OPEN_FAIL";
@@ -394,131 +433,199 @@ public:
             return;
         }
 
-        uint8_t c0_seq = 0;
-        uint8_t c1_seq = 0;
-        uint8_t exp_c0_rx_seq = 0;
-        uint8_t exp_c1_rx_seq = 0;
-        bool first_c0_rx = true;
-        bool first_c1_rx = true;
+        uint8_t tx_seq = 0;
+        uint8_t exp_rx_seq = 0;
+        bool first_rx = true;
 
         auto last_tx = std::chrono::steady_clock::now();
         auto last_calc = std::chrono::steady_clock::now();
-        uint64_t c0_rx_calc = 0;
-        uint64_t c1_rx_calc = 0;
+        uint64_t tx_calc = 0;
+        uint64_t rx_calc = 0;
+
+        CanDirection cur_dir = dir.load();
 
         while (active.load()) {
             auto now = std::chrono::steady_clock::now();
 
-            // TX: every 20ms (~50 frames/s each direction)
+            if (dir.load() != cur_dir) {
+                cur_dir = dir.load();
+                tx_seq = 0;
+                exp_rx_seq = 0;
+                first_rx = true;
+            }
+
+            // 1. TX: every 20ms (~50 frames/s)
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tx).count() >= 20) {
                 last_tx = now;
 
-                // CAN0 -> CAN1 frame
-                struct can_frame f0;
-                memset(&f0, 0, sizeof(f0));
-                f0.can_id = 0x121;
-                f0.can_dlc = 8;
-                f0.data[0] = 0xC0;
-                f0.data[1] = c0_seq++;
-                for (int i = 2; i < 7; ++i) f0.data[i] = (uint8_t)((f0.data[1] + i * 3) & 0xFF);
-                uint8_t sum0 = 0;
-                for (int i = 0; i < 7; ++i) sum0 += f0.data[i];
-                f0.data[7] = sum0;
-
-                if (write(s0, &f0, sizeof(f0)) == sizeof(f0)) {
-                    c0_to_c1_tx.fetch_add(1);
-                } else {
-                    c0_to_c1_err.fetch_add(1);
-                }
-
-                // CAN1 -> CAN0 frame
-                struct can_frame f1;
-                memset(&f1, 0, sizeof(f1));
-                f1.can_id = 0x221;
-                f1.can_dlc = 8;
-                f1.data[0] = 0xC1;
-                f1.data[1] = c1_seq++;
-                for (int i = 2; i < 7; ++i) f1.data[i] = (uint8_t)((f1.data[1] + i * 5) & 0xFF);
-                uint8_t sum1 = 0;
-                for (int i = 0; i < 7; ++i) sum1 += f1.data[i];
-                f1.data[7] = sum1;
-
-                if (write(s1, &f1, sizeof(f1)) == sizeof(f1)) {
-                    c1_to_c0_tx.fetch_add(1);
-                } else {
-                    c1_to_c0_err.fetch_add(1);
-                }
-            }
-
-            // RX on s1 (can1 receives 0x121 from can0)
-            while (true) {
-                struct can_frame rf1;
-                ssize_t r = read(s1, &rf1, sizeof(rf1));
-                if (r < (ssize_t)sizeof(rf1)) break;
-
-                if (rf1.can_id == 0x121 && rf1.can_dlc == 8 && rf1.data[0] == 0xC0) {
+                if (cur_dir == CanDirection::CAN0_TO_CAN1 || cur_dir == CanDirection::PING_PONG) {
+                    struct can_frame f0;
+                    memset(&f0, 0, sizeof(f0));
+                    f0.can_id = 0x121;
+                    f0.can_dlc = 8;
+                    f0.data[0] = 0xC0;
+                    f0.data[1] = tx_seq;
+                    for (int i = 2; i < 7; ++i) f0.data[i] = (uint8_t)((tx_seq + i * 3) & 0xFF);
                     uint8_t sum = 0;
-                    for (int i = 0; i < 7; ++i) sum += rf1.data[i];
-                    if (sum == rf1.data[7]) {
-                        c0_to_c1_rx.fetch_add(1);
-                        c0_rx_calc++;
-                        if (first_c1_rx) {
-                            exp_c1_rx_seq = rf1.data[1] + 1;
-                            first_c1_rx = false;
-                        } else {
-                            if (rf1.data[1] != exp_c1_rx_seq) {
-                                uint8_t diff = rf1.data[1] - exp_c1_rx_seq;
-                                c0_to_c1_err.fetch_add(diff);
-                                exp_c1_rx_seq = rf1.data[1] + 1;
-                            } else {
-                                exp_c1_rx_seq++;
-                            }
-                        }
+                    for (int i = 0; i < 7; ++i) sum += f0.data[i];
+                    f0.data[7] = sum;
+
+                    ssize_t w = write(s0, &f0, sizeof(f0));
+                    if (w == sizeof(f0)) {
+                        tx_frames.fetch_add(1);
+                        tx_calc++;
+                        tx_seq++;
                     } else {
-                        c0_to_c1_err.fetch_add(1);
+                        err_frames.fetch_add(1);
+                    }
+                } else if (cur_dir == CanDirection::CAN1_TO_CAN0) {
+                    struct can_frame f1;
+                    memset(&f1, 0, sizeof(f1));
+                    f1.can_id = 0x221;
+                    f1.can_dlc = 8;
+                    f1.data[0] = 0xC1;
+                    f1.data[1] = tx_seq;
+                    for (int i = 2; i < 7; ++i) f1.data[i] = (uint8_t)((tx_seq + i * 5) & 0xFF);
+                    uint8_t sum = 0;
+                    for (int i = 0; i < 7; ++i) sum += f1.data[i];
+                    f1.data[7] = sum;
+
+                    ssize_t w = write(s1, &f1, sizeof(f1));
+                    if (w == sizeof(f1)) {
+                        tx_frames.fetch_add(1);
+                        tx_calc++;
+                        tx_seq++;
+                    } else {
+                        err_frames.fetch_add(1);
                     }
                 }
             }
 
-            // RX on s0 (can0 receives 0x221 from can1)
-            while (true) {
-                struct can_frame rf0;
-                ssize_t r = read(s0, &rf0, sizeof(rf0));
-                if (r < (ssize_t)sizeof(rf0)) break;
+            // 2. RX Handling
+            if (cur_dir == CanDirection::CAN0_TO_CAN1) {
+                while (true) {
+                    struct can_frame rf1;
+                    ssize_t r = read(s1, &rf1, sizeof(rf1));
+                    if (r < (ssize_t)sizeof(rf1)) break;
 
-                if (rf0.can_id == 0x221 && rf0.can_dlc == 8 && rf0.data[0] == 0xC1) {
-                    uint8_t sum = 0;
-                    for (int i = 0; i < 7; ++i) sum += rf0.data[i];
-                    if (sum == rf0.data[7]) {
-                        c1_to_c0_rx.fetch_add(1);
-                        c1_rx_calc++;
-                        if (first_c0_rx) {
-                            exp_c0_rx_seq = rf0.data[1] + 1;
-                            first_c0_rx = false;
-                        } else {
-                            if (rf0.data[1] != exp_c0_rx_seq) {
-                                uint8_t diff = rf0.data[1] - exp_c0_rx_seq;
-                                c1_to_c0_err.fetch_add(diff);
-                                exp_c0_rx_seq = rf0.data[1] + 1;
+                    if (rf1.can_id == 0x121 && rf1.can_dlc == 8 && rf1.data[0] == 0xC0) {
+                        uint8_t sum = 0;
+                        for (int i = 0; i < 7; ++i) sum += rf1.data[i];
+                        if (sum == rf1.data[7]) {
+                            rx_frames.fetch_add(1);
+                            rx_calc++;
+                            if (first_rx) {
+                                exp_rx_seq = (uint8_t)(rf1.data[1] + 1);
+                                first_rx = false;
                             } else {
-                                exp_c0_rx_seq++;
+                                if (rf1.data[1] != exp_rx_seq) {
+                                    uint8_t diff = (uint8_t)(rf1.data[1] - exp_rx_seq);
+                                    err_frames.fetch_add(diff);
+                                    exp_rx_seq = (uint8_t)(rf1.data[1] + 1);
+                                } else {
+                                    exp_rx_seq++;
+                                }
                             }
+                        } else {
+                            err_frames.fetch_add(1);
                         }
-                    } else {
-                        c1_to_c0_err.fetch_add(1);
+                    }
+                }
+            } else if (cur_dir == CanDirection::CAN1_TO_CAN0) {
+                while (true) {
+                    struct can_frame rf0;
+                    ssize_t r = read(s0, &rf0, sizeof(rf0));
+                    if (r < (ssize_t)sizeof(rf0)) break;
+
+                    if (rf0.can_id == 0x221 && rf0.can_dlc == 8 && rf0.data[0] == 0xC1) {
+                        uint8_t sum = 0;
+                        for (int i = 0; i < 7; ++i) sum += rf0.data[i];
+                        if (sum == rf0.data[7]) {
+                            rx_frames.fetch_add(1);
+                            rx_calc++;
+                            if (first_rx) {
+                                exp_rx_seq = (uint8_t)(rf0.data[1] + 1);
+                                first_rx = false;
+                            } else {
+                                if (rf0.data[1] != exp_rx_seq) {
+                                    uint8_t diff = (uint8_t)(rf0.data[1] - exp_rx_seq);
+                                    err_frames.fetch_add(diff);
+                                    exp_rx_seq = (uint8_t)(rf0.data[1] + 1);
+                                } else {
+                                    exp_rx_seq++;
+                                }
+                            }
+                        } else {
+                            err_frames.fetch_add(1);
+                        }
+                    }
+                }
+            } else if (cur_dir == CanDirection::PING_PONG) {
+                while (true) {
+                    struct can_frame rf1;
+                    ssize_t r = read(s1, &rf1, sizeof(rf1));
+                    if (r < (ssize_t)sizeof(rf1)) break;
+
+                    if (rf1.can_id == 0x121 && rf1.can_dlc == 8 && rf1.data[0] == 0xC0) {
+                        uint8_t sum = 0;
+                        for (int i = 0; i < 7; ++i) sum += rf1.data[i];
+                        if (sum == rf1.data[7]) {
+                            struct can_frame pong;
+                            memset(&pong, 0, sizeof(pong));
+                            pong.can_id = 0x221;
+                            pong.can_dlc = 8;
+                            pong.data[0] = 0xC1;
+                            pong.data[1] = rf1.data[1];
+                            for (int i = 2; i < 7; ++i) pong.data[i] = (uint8_t)((pong.data[1] + i * 7) & 0xFF);
+                            uint8_t psum = 0;
+                            for (int i = 0; i < 7; ++i) psum += pong.data[i];
+                            pong.data[7] = psum;
+                            if (write(s1, &pong, sizeof(pong)) < 0) {}
+                        } else {
+                            err_frames.fetch_add(1);
+                        }
+                    }
+                }
+
+                while (true) {
+                    struct can_frame rf0;
+                    ssize_t r = read(s0, &rf0, sizeof(rf0));
+                    if (r < (ssize_t)sizeof(rf0)) break;
+
+                    if (rf0.can_id == 0x221 && rf0.can_dlc == 8 && rf0.data[0] == 0xC1) {
+                        uint8_t sum = 0;
+                        for (int i = 0; i < 7; ++i) sum += rf0.data[i];
+                        if (sum == rf0.data[7]) {
+                            rx_frames.fetch_add(1);
+                            rx_calc++;
+                            if (first_rx) {
+                                exp_rx_seq = (uint8_t)(rf0.data[1] + 1);
+                                first_rx = false;
+                            } else {
+                                if (rf0.data[1] != exp_rx_seq) {
+                                    uint8_t diff = (uint8_t)(rf0.data[1] - exp_rx_seq);
+                                    err_frames.fetch_add(diff);
+                                    exp_rx_seq = (uint8_t)(rf0.data[1] + 1);
+                                } else {
+                                    exp_rx_seq++;
+                                }
+                            }
+                        } else {
+                            err_frames.fetch_add(1);
+                        }
                     }
                 }
             }
 
-            // Calculate fps every 500ms
+            // 3. FPS calculation every 500ms
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_calc).count() >= 500) {
                 double dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_calc).count() / 1000.0;
                 last_calc = now;
                 if (dt <= 0) dt = 0.5;
-                c0_to_c1_fps.store(c0_rx_calc / dt);
-                c1_to_c0_fps.store(c1_rx_calc / dt);
-                c0_rx_calc = 0;
-                c1_rx_calc = 0;
+                tx_fps.store(tx_calc / dt);
+                rx_fps.store(rx_calc / dt);
+                tx_calc = 0;
+                rx_calc = 0;
             }
 
             usleep(2000);
@@ -545,6 +652,8 @@ struct UsbDiskInfo {
     std::atomic<uint64_t> write_ops{0};
     std::atomic<uint64_t> read_ops{0};
     std::atomic<uint64_t> errors{0};
+    std::atomic<uint64_t> disconnects{0};
+    std::atomic<uint64_t> recovers{0};
     std::atomic<double> write_speed_mb{0.0};
     std::atomic<double> read_speed_mb{0.0};
 
@@ -567,6 +676,99 @@ public:
         stop();
     }
 
+    bool is_mounted(const std::string& mount_point) {
+        std::ifstream f("/proc/mounts");
+        if (!f.is_open()) return false;
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::string dev, mnt;
+            if (ss >> dev >> mnt) {
+                if (mnt == mount_point) return true;
+            }
+        }
+        return false;
+    }
+
+    std::string find_disk_partition(const std::string& dev_name) {
+        std::string best_part = "";
+        long long max_size = 0;
+        // Check sysfs partition sizes (1..8) to select the largest data partition
+        // Avoid selecting 16MB EFI or Microsoft Reserved partitions (e.g. sda1 vs sda2)
+        for (int p = 1; p <= 8; ++p) {
+            std::string part_name = dev_name + std::to_string(p);
+            std::string size_file = "/sys/block/" + dev_name + "/" + part_name + "/size";
+            std::ifstream sf(size_file);
+            if (sf.is_open()) {
+                long long sz = 0;
+                if (sf >> sz && sz > max_size) {
+                    max_size = sz;
+                    best_part = "/dev/" + part_name;
+                }
+            }
+        }
+        if (!best_part.empty()) return best_part;
+
+        // Fallback: check if raw block device exists (unpartitioned disk)
+        if (access(("/dev/" + dev_name).c_str(), F_OK) == 0) {
+            return "/dev/" + dev_name;
+        }
+        return "";
+    }
+
+    void read_disk_sysfs(UsbDiskInfo& d) {
+        std::ifstream fm("/sys/block/" + d.dev_name + "/device/model");
+        if (fm.is_open()) {
+            std::getline(fm, d.model);
+            while (!d.model.empty() && (d.model.back() == ' ' || d.model.back() == '\r')) d.model.pop_back();
+        }
+        std::ifstream fs("/sys/block/" + d.dev_name + "/size");
+        long long sec = 0;
+        if (fs.is_open() && (fs >> sec)) {
+            d.capacity_gb = (double)sec * 512.0 / (1024.0 * 1024.0 * 1024.0);
+        }
+    }
+
+    bool try_mount_disk(UsbDiskInfo& d) {
+        if (is_mounted(d.mount_point)) {
+            d.mounted = true;
+            read_disk_sysfs(d);
+            return true;
+        }
+
+        std::string part = find_disk_partition(d.dev_name);
+        if (part.empty()) {
+            d.mounted = false;
+            return false;
+        }
+
+        d.part_name = part;
+        if (mkdir(d.mount_point.c_str(), 0755) < 0 && errno != EEXIST) {}
+
+        // Lazy unmount any stale broken mount point
+        std::string umnt = "umount -l " + d.mount_point + " 2>/dev/null";
+        if (system(umnt.c_str()) < 0) {}
+
+        std::string mnt_cmd;
+        if (d.fs_type == "exfat-fuse") {
+            mnt_cmd = "mount.exfat-fuse " + d.part_name + " " + d.mount_point + " 2>/dev/null || "
+                      "mount -t exfat " + d.part_name + " " + d.mount_point + " 2>/dev/null || "
+                      "mount " + d.part_name + " " + d.mount_point + " 2>/dev/null";
+        } else {
+            mnt_cmd = "mount -t ntfs-3g " + d.part_name + " " + d.mount_point + " 2>/dev/null || "
+                      "mount " + d.part_name + " " + d.mount_point + " 2>/dev/null";
+        }
+
+        if (system(mnt_cmd.c_str()) == 0) {
+            d.mounted = true;
+            read_disk_sysfs(d);
+            return true;
+        }
+
+        d.mounted = false;
+        return false;
+    }
+
     void init_disks() {
         disks.clear();
         disks.push_back(std::make_unique<UsbDiskInfo>("sda", "/dev/sda2", "/mnt/rk_usb_test/sda", "USB 1 (sda)", "ntfs-3g"));
@@ -578,43 +780,27 @@ public:
 
     void check_and_mount() {
         if (system("mkdir -p /mnt/rk_usb_test/{sda,sdb,sdc,sdd} 2>/dev/null") < 0) {}
-
         for (auto& d : disks) {
-            std::string part = d->part_name;
-            if (access(part.c_str(), F_OK) != 0) {
-                if (access(("/dev/" + d->dev_name + "1").c_str(), F_OK) == 0) part = "/dev/" + d->dev_name + "1";
-                else if (access(("/dev/" + d->dev_name + "2").c_str(), F_OK) == 0) part = "/dev/" + d->dev_name + "2";
-                else if (access(("/dev/" + d->dev_name).c_str(), F_OK) == 0) part = "/dev/" + d->dev_name;
-            }
+            try_mount_disk(*d);
+        }
+    }
 
-            if (access(part.c_str(), F_OK) != 0) {
-                // Device not plugged in
-                std::string umnt = "umount -l " + d->mount_point + " 2>/dev/null";
-                if (system(umnt.c_str()) < 0) {}
-                d->mounted = false;
+    void check_and_update_disks() {
+        for (auto& d : disks) {
+            if (is_mounted(d->mount_point)) {
+                d->mounted = true;
                 continue;
             }
 
-            d->part_name = part;
-            std::ifstream fm("/sys/block/" + d->dev_name + "/device/model");
-            if (fm.is_open()) {
-                std::getline(fm, d->model);
-                while (!d->model.empty() && (d->model.back() == ' ' || d->model.back() == '\r')) d->model.pop_back();
-            }
-            std::ifstream fs("/sys/block/" + d->dev_name + "/size");
-            long long sec = 0;
-            if (fs.is_open() && (fs >> sec)) {
-                d->capacity_gb = (double)sec * 512.0 / (1024.0 * 1024.0 * 1024.0);
-            }
-
-            std::string chk = "mount | grep -q ' " + d->mount_point + " '";
-            if (system(chk.c_str()) == 0) {
-                d->mounted = true;
+            std::string part = find_disk_partition(d->dev_name);
+            if (part.empty()) {
+                if (d->mounted) {
+                    d->mounted = false;
+                    std::string umnt = "umount -l " + d->mount_point + " 2>/dev/null";
+                    if (system(umnt.c_str()) < 0) {}
+                }
             } else {
-                std::string mnt_cmd = "mount -t ntfs-3g " + d->part_name + " " + d->mount_point + " 2>/dev/null || "
-                                      "mount.exfat-fuse " + d->part_name + " " + d->mount_point + " 2>/dev/null || "
-                                      "mount " + d->part_name + " " + d->mount_point + " 2>/dev/null";
-                d->mounted = (system(mnt_cmd.c_str()) == 0);
+                try_mount_disk(*d);
             }
         }
     }
@@ -649,6 +835,8 @@ public:
             d->write_ops.store(0);
             d->read_ops.store(0);
             d->errors.store(0);
+            d->disconnects.store(0);
+            d->recovers.store(0);
             d->write_speed_mb.store(0.0);
             d->read_speed_mb.store(0.0);
         }
@@ -687,8 +875,6 @@ public:
 private:
     void worker_loop(size_t idx) {
         auto& d = *disks[idx];
-        if (!d.mounted) return;
-
         std::string test_file = d.mount_point + "/.rk_test_io_" + d.dev_name + ".dat";
         const size_t BLK_SIZE = 1 * 1024 * 1024; // 1MB test block
         std::vector<uint8_t> w_buf(BLK_SIZE);
@@ -701,6 +887,18 @@ private:
         uint64_t r_since_calc = 0;
 
         while (active.load()) {
+            if (!d.mounted) {
+                d.write_speed_mb.store(0.0);
+                d.read_speed_mb.store(0.0);
+
+                if (try_mount_disk(d)) {
+                    d.recovers.fetch_add(1);
+                } else {
+                    usleep(500000);
+                    continue;
+                }
+            }
+
             for (size_t i = 0; i < BLK_SIZE; i += 4) {
                 uint32_t val = seed + (uint32_t)i;
                 std::memcpy(&w_buf[i], &val, 4);
@@ -710,59 +908,112 @@ private:
             // 1. Write phase
             int fd = open(test_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
             if (fd < 0) {
-                if (active.load()) d.errors.fetch_add(1);
-                usleep(200000);
+                if (active.load()) {
+                    d.errors.fetch_add(1);
+                    std::string part = find_disk_partition(d.dev_name);
+                    if (part.empty()) {
+                        d.mounted = false;
+                        d.disconnects.fetch_add(1);
+                        std::string umnt = "umount -l " + d.mount_point + " 2>/dev/null";
+                        if (system(umnt.c_str()) < 0) {}
+                    }
+                }
+                usleep(300000);
                 continue;
             }
 
             size_t written = 0;
+            bool write_err = false;
             while (written < BLK_SIZE && active.load()) {
                 ssize_t w = write(fd, w_buf.data() + written, BLK_SIZE - written);
-                if (w <= 0) break;
+                if (w <= 0) {
+                    write_err = true;
+                    break;
+                }
                 written += w;
             }
-            if (written == BLK_SIZE) {
-                fdatasync(fd);
+            if (written == BLK_SIZE && !write_err) {
+                if (fdatasync(fd) < 0) {
+                    write_err = true;
+                }
             }
             close(fd);
 
-            if (written == BLK_SIZE) {
-                d.write_bytes.fetch_add(written);
-                d.write_ops.fetch_add(1);
-                w_since_calc += written;
-            } else if (active.load()) {
-                d.errors.fetch_add(1);
+            if (write_err || written < BLK_SIZE) {
+                if (active.load()) {
+                    d.errors.fetch_add(1);
+                    std::string part = find_disk_partition(d.dev_name);
+                    if (part.empty()) {
+                        d.mounted = false;
+                        d.disconnects.fetch_add(1);
+                        std::string umnt = "umount -l " + d.mount_point + " 2>/dev/null";
+                        if (system(umnt.c_str()) < 0) {}
+                    }
+                }
+                unlink(test_file.c_str());
+                usleep(300000);
+                continue;
             }
+
+            d.write_bytes.fetch_add(written);
+            d.write_ops.fetch_add(1);
+            w_since_calc += written;
 
             if (!active.load()) break;
 
             // 2. Read phase
             int rfd = open(test_file.c_str(), O_RDONLY);
             if (rfd < 0) {
-                if (active.load()) d.errors.fetch_add(1);
-                usleep(200000);
+                if (active.load()) {
+                    d.errors.fetch_add(1);
+                    std::string part = find_disk_partition(d.dev_name);
+                    if (part.empty()) {
+                        d.mounted = false;
+                        d.disconnects.fetch_add(1);
+                        std::string umnt = "umount -l " + d.mount_point + " 2>/dev/null";
+                        if (system(umnt.c_str()) < 0) {}
+                    }
+                }
+                unlink(test_file.c_str());
+                usleep(300000);
                 continue;
             }
 
             size_t read_bytes = 0;
+            bool read_err = false;
             while (read_bytes < BLK_SIZE && active.load()) {
                 ssize_t r = read(rfd, r_buf.data() + read_bytes, BLK_SIZE - read_bytes);
-                if (r <= 0) break;
+                if (r <= 0) {
+                    read_err = true;
+                    break;
+                }
                 read_bytes += r;
             }
             close(rfd);
 
-            if (read_bytes == BLK_SIZE) {
-                d.read_bytes.fetch_add(read_bytes);
-                d.read_ops.fetch_add(1);
-                r_since_calc += read_bytes;
-
-                // 3. Verify data integrity
-                if (std::memcmp(w_buf.data(), r_buf.data(), BLK_SIZE) != 0) {
-                    if (active.load()) d.errors.fetch_add(1);
+            if (read_err || read_bytes < BLK_SIZE) {
+                if (active.load()) {
+                    d.errors.fetch_add(1);
+                    std::string part = find_disk_partition(d.dev_name);
+                    if (part.empty()) {
+                        d.mounted = false;
+                        d.disconnects.fetch_add(1);
+                        std::string umnt = "umount -l " + d.mount_point + " 2>/dev/null";
+                        if (system(umnt.c_str()) < 0) {}
+                    }
                 }
-            } else if (active.load()) {
-                d.errors.fetch_add(1);
+                unlink(test_file.c_str());
+                usleep(300000);
+                continue;
+            }
+
+            d.read_bytes.fetch_add(read_bytes);
+            d.read_ops.fetch_add(1);
+            r_since_calc += read_bytes;
+
+            // 3. Verify data integrity
+            if (std::memcmp(w_buf.data(), r_buf.data(), BLK_SIZE) != 0) {
+                if (active.load()) d.errors.fetch_add(1);
             }
 
             unlink(test_file.c_str());
@@ -1051,7 +1302,15 @@ public:
         if (!emc_active.load()) return;
 
         for (auto& port : net_ports) {
-            if (!port.enabled || !port.carrier || port.raw_sock < 0) continue;
+            if (!port.enabled) continue;
+
+            if (!port.carrier || port.raw_sock < 0) {
+                // Link is down / cable unplugged during active test:
+                // Count packet attempt and record as LOST!
+                port.sent++;
+                port.lost++;
+                continue;
+            }
 
             std::vector<char> send_buf(emc_packet_size, 0);
             struct icmphdr *icmp = (struct icmphdr *)send_buf.data();
@@ -1082,6 +1341,10 @@ public:
                 sp.replied = false;
                 sp.marked_lost = false;
                 port.sent_map[seq] = sp;
+            } else {
+                // Hardware transmission failed (e.g. cable disconnected just as packet was sending)
+                port.sent++;
+                port.lost++;
             }
         }
     }
@@ -1191,9 +1454,27 @@ public:
             if (carrier != port.carrier) {
                 if (port.carrier && !carrier) {
                     port.flaps++;
-                    log_emc_event("FLAP", "CRITICAL: " + port.ch_name + " Link Down (disconnected)!", 3);
+                    log_emc_event("FLAP", "CRITICAL: " + port.ch_name + " Link Down (cable unplugged)!", 3);
                 } else if (!port.carrier && carrier) {
-                    log_emc_event("INFO", "INFO: " + port.ch_name + " Link Up!", 1);
+                    std::string spd_str = port.speed > 0 ? std::to_string(port.speed) : "1000";
+                    log_emc_event("INFO", "INFO: " + port.ch_name + " Link Up (" + spd_str + "M)! Auto-resuming ping.", 1);
+                    // Ensure IP address is configured on this port if missing
+                    if (port.current_ip == "No IP" || port.current_ip.empty()) {
+                        std::string cmd = "ip addr add " + port.target_ip + "/24 dev " + port.name + " 2>/dev/null; ip link set " + port.name + " up";
+                        if (system(cmd.c_str()) < 0) {}
+                    }
+                    // Ensure raw socket is healthy
+                    if (port.raw_sock < 0) {
+                        port.raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+                        if (port.raw_sock >= 0) {
+                            struct ifreq ifr;
+                            std::memset(&ifr, 0, sizeof(ifr));
+                            std::strncpy(ifr.ifr_name, port.name.c_str(), IFNAMSIZ - 1);
+                            setsockopt(port.raw_sock, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr));
+                            int flags = fcntl(port.raw_sock, F_GETFL, 0);
+                            fcntl(port.raw_sock, F_SETFL, flags | O_NONBLOCK);
+                        }
+                    }
                 }
                 port.carrier = carrier;
             }
@@ -1554,7 +1835,7 @@ void print_summary_report(RkTesterEngine* engine) {
         uint64_t rx_f = sc.rx_frames.load();
         uint64_t err_f = sc.err_frames.load();
         double loss_pct = (tx_f > 0) ? (err_f * 100.0 / tx_f) : 0.0;
-        char buf[128];
+        char buf[256];
         snprintf(buf, sizeof(buf), " * %-22s: TX: %llu KB (%llu pkts), RX: %llu KB (%llu pkts), Err: %llu (%4.1f%%)",
                  title.c_str(),
                  (unsigned long long)tx_k, (unsigned long long)tx_f,
@@ -1572,38 +1853,19 @@ void print_summary_report(RkTesterEngine* engine) {
     print_serial_summary("RS232 (ttyS0 -> ttyS1)", engine->rs232);
     print_serial_summary("RS485 (ttyS2 -> ttyS3)", engine->rs485);
     std::cout << "--------------------------------------------------------------------\n";
-    std::cout << " CAN Bus (CAN0 <-> CAN1) Mutual Transmission Summary:\n";
-    auto print_can_summary = [](const std::string& title, uint64_t tx_f, uint64_t rx_f, uint64_t err_f) {
-        double loss_pct = (tx_f > 0) ? (err_f * 100.0 / tx_f) : 0.0;
-        char buf[128];
-        snprintf(buf, sizeof(buf), " * %-22s: TX: %llu pkts, RX: %llu pkts, Err: %llu (%4.1f%%)",
-                 title.c_str(),
-                 (unsigned long long)tx_f,
-                 (unsigned long long)rx_f,
-                 (unsigned long long)err_f, loss_pct);
-        std::cout << buf;
-        if (tx_f == 0) {
-            std::cout << " [NOT TESTED]\n";
-        } else if (err_f == 0) {
-            std::cout << " [PASS]\n";
-        } else {
-            std::cout << " [FAIL/ERRORS]\n";
-        }
-    };
-    print_can_summary("CAN0 -> CAN1 (0x121)",
-                      engine->can_tester.c0_to_c1_tx.load(),
-                      engine->can_tester.c0_to_c1_rx.load(),
-                      engine->can_tester.c0_to_c1_err.load());
-    print_can_summary("CAN1 -> CAN0 (0x221)",
-                      engine->can_tester.c1_to_c0_tx.load(),
-                      engine->can_tester.c1_to_c0_rx.load(),
-                      engine->can_tester.c1_to_c0_err.load());
-    uint64_t tot_can_tx = engine->can_tester.c0_to_c1_tx.load() + engine->can_tester.c1_to_c0_tx.load();
-    uint64_t tot_can_err = engine->can_tester.c0_to_c1_err.load() + engine->can_tester.c1_to_c0_err.load();
-    std::cout << " Total CAN Bus      : ";
-    if (tot_can_tx == 0) std::cout << "[NOT TESTED]\n";
-    else if (tot_can_err == 0) std::cout << "[ALL PASS - 0 ERRORS]\n";
-    else std::cout << "[FAIL - " << tot_can_err << " ERRORS]\n";
+    std::cout << " CAN Bus (can0 / can1) Transmission Summary:\n";
+    std::string mode_str = engine->can_tester.get_mode_name();
+    uint64_t can_tx = engine->can_tester.tx_frames.load();
+    uint64_t can_rx = engine->can_tester.rx_frames.load();
+    uint64_t can_err = engine->can_tester.err_frames.load();
+    double can_loss_pct = (can_tx > 0) ? (can_err * 100.0 / can_tx) : 0.0;
+    std::cout << " * Mode Configured  : " << mode_str << "\n";
+    std::cout << " * Frames Processed : TX: " << can_tx << " pkts | RX Verified: " << can_rx << " pkts\n";
+    std::cout << " * Errors / Drops   : " << can_err << " errors (" << can_loss_pct << "%)\n";
+    std::cout << " * Total CAN Result : ";
+    if (can_tx == 0) std::cout << "[NOT TESTED]\n";
+    else if (can_err == 0 && can_rx > 0) std::cout << "[ALL PASS - 0 ERRORS]\n";
+    else std::cout << "[FAIL - " << can_err << " ERRORS]\n";
     std::cout << "--------------------------------------------------------------------\n";
     std::cout << " 4-Port USB Storage Read/Write Stress Detailed Summary:\n";
     for (size_t i = 0; i < engine->usb_tester.disks.size(); ++i) {
@@ -1621,13 +1883,18 @@ void print_summary_report(RkTesterEngine* engine) {
 
         std::cout << " * Port " << (i + 1) << " (" << d->dev_name << "): " << mod << cap_buf << "\n";
         std::cout << "   - Mount Point : " << d->mount_point << " (" << d->fs_type << ", Part: " << d->part_name << ")\n";
-        if (!d->mounted) {
-            std::cout << "   - Status      : [NOT CONNECTED / UNPLUGGED]\n";
-        } else if (w_mb == 0 && r_mb == 0) {
-            std::cout << "   - Status      : [NOT TESTED] (Test was not started on this device)\n";
+        if (w_mb == 0 && r_mb == 0 && errs == 0) {
+            if (!d->mounted) {
+                std::cout << "   - Status      : [NOT CONNECTED / UNPLUGGED]\n";
+            } else {
+                std::cout << "   - Status      : [NOT TESTED] (Test was not started on this device)\n";
+            }
         } else {
             std::cout << "   - Data Tested : Written: " << w_mb << " MB (" << w_ops << " blocks) | Read: " << r_mb << " MB (" << r_ops << " blocks)\n";
-            std::cout << "   - Verification: Data Integrity 100% Verified, Errors: " << errs;
+            std::cout << "   - Verification: Errors: " << errs;
+            if (d->disconnects.load() > 0) {
+                std::cout << " (Unplug/IO failures: " << d->disconnects.load() << ", Auto-recovered: " << d->recovers.load() << ")";
+            }
             if (errs == 0) {
                 std::cout << " [PASS]\n";
             } else {
@@ -1684,6 +1951,31 @@ void draw_bar(int y, int x, int width, double percent, int color_pair) {
     attroff(COLOR_PAIR(7));
 }
 
+void draw_section_banner(int y, int w, int badge_pair, int line_pair, const char* badge, const char* subinfo = "") {
+    int x = 2;
+    attron(COLOR_PAIR(badge_pair) | A_BOLD);
+    mvprintw(y, x, " %s ", badge);
+    attroff(COLOR_PAIR(badge_pair) | A_BOLD);
+    x += (int)strlen(badge) + 2;
+
+    if (subinfo && strlen(subinfo) > 0) {
+        mvprintw(y, x, " ");
+        x += 1;
+        attron(COLOR_PAIR(7) | A_BOLD);
+        mvprintw(y, x, "%s", subinfo);
+        attroff(COLOR_PAIR(7) | A_BOLD);
+        x += (int)strlen(subinfo);
+        mvprintw(y, x, " ");
+        x += 1;
+    }
+
+    if (x < w - 2) {
+        attron(COLOR_PAIR(line_pair));
+        mvhline(y, x, '-', w - 2 - x);
+        attroff(COLOR_PAIR(line_pair));
+    }
+}
+
 int get_color_by_load(double pct) {
     if (pct > 80.0) return COLOR_PAIR(3);
     if (pct > 40.0) return COLOR_PAIR(2);
@@ -1724,7 +2016,8 @@ int main(int argc, char* argv[]) {
                       << "  [6] Toggle RS232 Unidirectional Test (ttyS0 -> ttyS1)\n"
                       << "  [7] Toggle RS485 Unidirectional Test (ttyS2 -> ttyS3)\n"
                       << "  [8] Toggle 4-Port USB Storage Read/Write Stress (sda..sdd)\n"
-                      << "  [9] Toggle CAN0 <-> CAN1 Cross-Test (can0 <-> can1 500k 8B frames)\n"
+                      << "  [9] Toggle CAN Bus Test (can0 / can1)\n"
+                      << "  [D] Switch CAN Direction (CAN0->CAN1 / CAN1->CAN0 / Ping-Pong)\n"
                       << "  [T] Change Target Host IP Dynamically\n"
                       << "  [R] Reset Statistics (All items)\n"
                       << "  [P] Switch CPU/GPU Governor (Performance / Schedutil)\n"
@@ -1734,6 +2027,12 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "-m" || arg == "--menu") {
             start_in_menu = true;
+        } else if (arg == "--can-0to1") {
+            engine.can_tester.set_direction(CanDirection::CAN0_TO_CAN1);
+        } else if (arg == "--can-1to0") {
+            engine.can_tester.set_direction(CanDirection::CAN1_TO_CAN0);
+        } else if (arg == "--can-pingpong") {
+            engine.can_tester.set_direction(CanDirection::PING_PONG);
         } else {
             struct sockaddr_in sa;
             if (inet_pton(AF_INET, arg.c_str(), &(sa.sin_addr)) == 1) {
@@ -1763,6 +2062,13 @@ int main(int argc, char* argv[]) {
         init_pair(6, COLOR_BLUE, -1);
         init_pair(7, COLOR_WHITE, -1);
         init_pair(8, COLOR_BLACK, -1);
+        // Striking high-contrast section badges
+        init_pair(9,  COLOR_BLACK, COLOR_CYAN);    // Black on Cyan: Compute & SoC
+        init_pair(10, COLOR_BLACK, COLOR_GREEN);   // Black on Green: Gigabit Ethernet
+        init_pair(11, COLOR_BLACK, COLOR_YELLOW);  // Black on Yellow: Fieldbus
+        init_pair(12, COLOR_WHITE, COLOR_BLUE);    // White on Blue: USB Storage
+        init_pair(13, COLOR_WHITE, COLOR_MAGENTA); // White on Magenta: Highlights
+        init_pair(14, COLOR_BLACK, COLOR_WHITE);   // Black on White: Top Header
     }
 
     engine.get_cpu_loads();
@@ -1771,6 +2077,7 @@ int main(int argc, char* argv[]) {
     auto last_ping_send = std::chrono::steady_clock::now();
     auto last_draw = std::chrono::steady_clock::now();
     auto last_net_update = std::chrono::steady_clock::now();
+    auto last_usb_update = std::chrono::steady_clock::now();
 
     bool menu_open = start_in_menu;
     int menu_cursor = 0;
@@ -1887,6 +2194,9 @@ int main(int argc, char* argv[]) {
                     menu_usb = !menu_usb; menu_cursor = 6;
                 } else if (ch == '9') {
                     menu_can = !menu_can; menu_cursor = 7;
+                } else if (ch == 'd' || ch == 'D') {
+                    engine.can_tester.cycle_direction();
+                    prompt_status = "CAN mode switched: " + engine.can_tester.get_mode_name();
                 } else if (ch == 'a' || ch == 'A') {
                     menu_cpu = true; menu_gpu = true; menu_npu = true;
                     menu_emc = true; menu_rs232 = true; menu_rs485 = true;
@@ -1941,7 +2251,10 @@ int main(int argc, char* argv[]) {
                     prompt_status = engine.usb_tester.active.load() ? "4-Port USB storage R/W stress STARTED." : "USB storage stress STOPPED.";
                 } else if (ch == '9') {
                     engine.toggle_can();
-                    prompt_status = engine.can_tester.active.load() ? "CAN0 <-> CAN1 cross-test STARTED." : "CAN cross-test STOPPED.";
+                    prompt_status = engine.can_tester.active.load() ? ("CAN (" + engine.can_tester.get_mode_name() + ") STARTED.") : "CAN test STOPPED.";
+                } else if (ch == 'd' || ch == 'D') {
+                    engine.can_tester.cycle_direction();
+                    prompt_status = "CAN mode switched to: " + engine.can_tester.get_mode_name();
                 } else if (ch == 't' || ch == 'T') {
                     // Interactive target IP modification
                     echo();
@@ -2000,6 +2313,12 @@ int main(int argc, char* argv[]) {
             engine.update_net_status();
         }
 
+        // 4. 定时检测 USB 存储热插拔 (每1000ms)
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_usb_update).count() >= 1000) {
+            last_usb_update = now;
+            engine.usb_tester.check_and_update_disks();
+        }
+
         // 4. 定时渲染 TUI 界面 (每100ms)
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() >= 100) {
             last_draw = now;
@@ -2039,7 +2358,7 @@ int main(int argc, char* argv[]) {
                 attroff(COLOR_PAIR(4) | A_BOLD);
 
                 attron(COLOR_PAIR(7));
-                mvprintw(my + 3, mx, "| Use [Up/Down], [Space] to toggle, [1..3, 5..9] for quick toggle:     |");
+                mvprintw(my + 3, mx, "| Use [Up/Down], [Space] to toggle, [1..9] quick toggle, [D] CAN Dir:  |");
                 mvprintw(my + 4, mx, "|                                                                      |");
                 attroff(COLOR_PAIR(7));
 
@@ -2059,7 +2378,7 @@ int main(int argc, char* argv[]) {
                     {4, "[6]", "RS232 Serial Loopback    ", "ttyS0 -> ttyS1 (115200 8N1)", menu_rs232},
                     {5, "[7]", "RS485 Serial Loopback    ", "ttyS2 -> ttyS3 (115200 8N1)", menu_rs485},
                     {6, "[8]", "4-Port USB Storage Stress", "sda..sdd read/write & verify", menu_usb},
-                    {7, "[9]", "CAN0 <-> CAN1 Cross-Test ", "can0 <-> can1 500k 8B frames", menu_can}
+                    {7, "[9]", "CAN Bus Stress (" + engine.can_tester.get_short_mode_name() + ")", engine.can_tester.get_mode_name() + " [D]", menu_can}
                 };
 
                 for (int i = 0; i < 8; ++i) {
@@ -2214,107 +2533,235 @@ int main(int argc, char* argv[]) {
             }
 
             // Top title
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(0, 2, "RK3576 Hardware Test Platform (Stress + 4-LAN + Serial + USB)");
-            attroff(COLOR_PAIR(4) | A_BOLD);
+            attron(COLOR_PAIR(14) | A_BOLD);
+            mvprintw(0, 2, " RK3576 INDUSTRIAL HARDWARE TEST PLATFORM ");
+            attroff(COLOR_PAIR(14) | A_BOLD);
 
             char meta[128];
             snprintf(meta, sizeof(meta), "Uptime: %s | Gov: %s",
                      uptime.c_str(), engine.governor_perf ? "PERF" : "DYNAMIC");
             attron(COLOR_PAIR(7));
-            mvprintw(0, std::max(48, w - (int)strlen(meta) - 4), "%s", meta);
+            mvprintw(0, std::max(48, w - (int)strlen(meta) - 3), "%s", meta);
             attroff(COLOR_PAIR(7));
 
-            attron(COLOR_PAIR(4));
-            mvhline(1, 2, '=', w - 4);
-            attroff(COLOR_PAIR(4));
-
-            // Module 1: CPU Monitor & Stress
-            int line = 2;
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(line, 2, "[CPU Monitor & Stress]");
-            attroff(COLOR_PAIR(4) | A_BOLD);
-
-            std::string cpu_st = engine.cpu_stress.load() ? "[STRESS ON: 8-CORES]" : "[IDLE]";
-            int cpu_col = engine.cpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
-            attron(cpu_col);
-            mvprintw(line, 26, "%s", cpu_st.c_str());
-            attroff(cpu_col);
-
-            attron(COLOR_PAIR(7) | A_BOLD);
-            mvprintw(line, 48, "Total: ");
-            attroff(COLOR_PAIR(7) | A_BOLD);
-            draw_bar(line, 55, w - 58, total_cpu, get_color_by_load(total_cpu));
-            line++;
-
-            int half_w = (w - 4) / 2;
-            int bar_w = half_w - 20;
-            for (int i = 0; i < 4; ++i) {
-                // Little cores A53
-                int f_a53 = (i < (int)cpu_freqs.size()) ? cpu_freqs[i] : 0;
-                double p_a53 = (i < (int)core_cpus.size()) ? core_cpus[i] : 0.0;
-                attron(COLOR_PAIR(7));
-                mvprintw(line + i, 3, "A53 Core C%d:", i);
-                attroff(COLOR_PAIR(7));
-                draw_bar(line + i, 15, bar_w, p_a53, get_color_by_load(p_a53));
-                attron(COLOR_PAIR(6));
-                mvprintw(line + i, 15 + bar_w + 1, "%4dM", f_a53);
-                attroff(COLOR_PAIR(6));
-
-                // Big cores A72
-                int bi = i + 4;
-                int f_a72 = (bi < (int)cpu_freqs.size()) ? cpu_freqs[bi] : 0;
-                double p_a72 = (bi < (int)core_cpus.size()) ? core_cpus[bi] : 0.0;
-                attron(COLOR_PAIR(7));
-                mvprintw(line + i, half_w + 2, "A72 Core C%d:", bi);
-                attroff(COLOR_PAIR(7));
-                draw_bar(line + i, half_w + 14, bar_w, p_a72, get_color_by_load(p_a72));
-                attron(COLOR_PAIR(6));
-                mvprintw(line + i, half_w + 14 + bar_w + 1, "%4dM", f_a72);
-                attroff(COLOR_PAIR(6));
+            bool spacious = (h >= 30);
+            int line = 1;
+            if (spacious) {
+                attron(COLOR_PAIR(4));
+                mvhline(1, 2, '=', w - 4);
+                attroff(COLOR_PAIR(4));
+                line = 2;
             }
-            line += 4;
 
-            // Module 2: GPU & NPU Accelerators (Single line)
-            attron(COLOR_PAIR(7) | A_BOLD);
-            mvprintw(line, 2, "Mali GPU:");
-            attroff(COLOR_PAIR(7) | A_BOLD);
-            std::string gpu_st = engine.gpu_stress.load() ? "[RUN]" : "[IDLE]";
-            int gpu_col = engine.gpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
-            attron(gpu_col);
-            mvprintw(line, 12, "%s", gpu_st.c_str());
-            attroff(gpu_col);
-            draw_bar(line, 19, 14, gpu_load, get_color_by_load(gpu_load));
-            attron(COLOR_PAIR(6));
-            mvprintw(line, 34, "%4dM", gpu_freq);
-            attroff(COLOR_PAIR(6));
+            // ====================================================================
+            // SECTION 1: COMPUTE & SOC ACCELERATORS (CPU, GPU, NPU, RAM, Temp)
+            // ====================================================================
+            draw_section_banner(line++, w, 9, 4, "[1..3] COMPUTE & SOC ACCELERATORS", "CPU / GPU / NPU / Memory / Temp");
 
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 40, "| NPU:");
-            attroff(COLOR_PAIR(7));
-            std::string npu_st = engine.npu_stress.load() ? "[RUN]" : "[IDLE]";
-            int npu_col = engine.npu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
-            attron(npu_col);
-            mvprintw(line, 47, "%s", npu_st.c_str());
-            attroff(npu_col);
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 54, "C0:%3.0f%% C1:%3.0f%%", npu_loads[0], npu_loads[1]);
-            attroff(COLOR_PAIR(7));
-            attron(COLOR_PAIR(6));
-            mvprintw(line, 71, "%4dM", npu_freq);
-            attroff(COLOR_PAIR(6));
+            if (spacious) {
+                // Row 1: CPU Total Load bar
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "CPU Stress:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+
+                std::string cpu_st = engine.cpu_stress.load() ? "[STRESS ON: 8-CORES]" : "[IDLE]";
+                int cpu_col = engine.cpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(cpu_col);
+                mvprintw(line, 16, "%s", cpu_st.c_str());
+                attroff(cpu_col);
+
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 39, "Total Load: ");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                draw_bar(line, 51, w - 54, total_cpu, get_color_by_load(total_cpu));
+                line++;
+
+                // Rows 2..5: 4 rows for A53 & A72 cores with graphical bars
+                int half_w = (w - 4) / 2;
+                int bar_w = half_w - 20;
+                for (int i = 0; i < 4; ++i) {
+                    // Little cores A53
+                    int f_a53 = (i < (int)cpu_freqs.size()) ? cpu_freqs[i] : 0;
+                    double p_a53 = (i < (int)core_cpus.size()) ? core_cpus[i] : 0.0;
+                    attron(COLOR_PAIR(7));
+                    mvprintw(line + i, 3, "A53 Core C%d:", i);
+                    attroff(COLOR_PAIR(7));
+                    draw_bar(line + i, 15, bar_w, p_a53, get_color_by_load(p_a53));
+                    attron(COLOR_PAIR(6));
+                    mvprintw(line + i, 15 + bar_w + 1, "%4dM", f_a53);
+                    attroff(COLOR_PAIR(6));
+
+                    // Big cores A72
+                    int bi = i + 4;
+                    int f_a72 = (bi < (int)cpu_freqs.size()) ? cpu_freqs[bi] : 0;
+                    double p_a72 = (bi < (int)core_cpus.size()) ? core_cpus[bi] : 0.0;
+                    attron(COLOR_PAIR(7));
+                    mvprintw(line + i, half_w + 2, "A72 Core C%d:", bi);
+                    attroff(COLOR_PAIR(7));
+                    draw_bar(line + i, half_w + 14, bar_w, p_a72, get_color_by_load(p_a72));
+                    attron(COLOR_PAIR(6));
+                    mvprintw(line + i, half_w + 14 + bar_w + 1, "%4dM", f_a72);
+                    attroff(COLOR_PAIR(6));
+                }
+                line += 4;
+
+                // Row 6: GPU & NPU Accelerators
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "Mali GPU:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                std::string gpu_st = engine.gpu_stress.load() ? "[RUN]" : "[IDLE]";
+                int gpu_col = engine.gpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(gpu_col);
+                mvprintw(line, 13, "%s", gpu_st.c_str());
+                attroff(gpu_col);
+                draw_bar(line, 20, 14, gpu_load, get_color_by_load(gpu_load));
+                attron(COLOR_PAIR(6));
+                mvprintw(line, 35, "%4dM", gpu_freq);
+                attroff(COLOR_PAIR(6));
+
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 41, "| NPU:");
+                attroff(COLOR_PAIR(7));
+                std::string npu_st = engine.npu_stress.load() ? "[RUN]" : "[IDLE]";
+                int npu_col = engine.npu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(npu_col);
+                mvprintw(line, 48, "%s", npu_st.c_str());
+                attroff(npu_col);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 55, "C0:%3.0f%% C1:%3.0f%%", npu_loads[0], npu_loads[1]);
+                attroff(COLOR_PAIR(7));
+                attron(COLOR_PAIR(6));
+                mvprintw(line, 71, "%4dM", npu_freq);
+                attroff(COLOR_PAIR(6));
+                line++;
+
+                // Row 7: RAM & Temperature
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "RAM Load:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 13, "%3.1fG/%3.1fG", used_ram, tot_ram);
+                attroff(COLOR_PAIR(7));
+                draw_bar(line, 24, 12, ram_pct, get_color_by_load(ram_pct));
+
+                attron(COLOR_PAIR(5) | A_BOLD);
+                mvprintw(line, 40, "| Temp: SoC:%.0fC Big:%.0fC GPU:%.0fC NPU:%.0fC",
+                         thermals["soc"], thermals["bigcore"], thermals["gpu"], thermals["npu"]);
+                attroff(COLOR_PAIR(5) | A_BOLD);
+                line++;
+            } else {
+                // Compact mode (h < 30): 4 lines
+                // Row 1: CPU Total + RAM + Temp
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "CPU:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+
+                std::string cpu_st = engine.cpu_stress.load() ? "[STRESS ON]" : "[IDLE]";
+                int cpu_col = engine.cpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(cpu_col);
+                mvprintw(line, 8, "%s", cpu_st.c_str());
+                attroff(cpu_col);
+
+                draw_bar(line, 20, 12, total_cpu, get_color_by_load(total_cpu));
+
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 33, "| RAM:%3.1fG/%3.1fG", used_ram, tot_ram);
+                attroff(COLOR_PAIR(7));
+
+                attron(COLOR_PAIR(5) | A_BOLD);
+                mvprintw(line, 52, "| Temp:SoC:%.0fC Big:%.0fC", thermals["soc"], thermals["bigcore"]);
+                attroff(COLOR_PAIR(5) | A_BOLD);
+                line++;
+
+                // Row 2: A53 Cores
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "A53:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                int cx = 8;
+                for (int i = 0; i < 4; ++i) {
+                    double p = (i < (int)core_cpus.size()) ? core_cpus[i] : 0.0;
+                    int f = (i < (int)cpu_freqs.size()) ? cpu_freqs[i] : 0;
+                    attron(COLOR_PAIR(7));
+                    mvprintw(line, cx, "C%d:", i);
+                    attroff(COLOR_PAIR(7));
+                    attron(get_color_by_load(p) | A_BOLD);
+                    mvprintw(line, cx + 3, "%2.0f%%", p);
+                    attroff(get_color_by_load(p) | A_BOLD);
+                    attron(COLOR_PAIR(6));
+                    mvprintw(line, cx + 6, "(%dM)", f);
+                    attroff(COLOR_PAIR(6));
+                    cx += 17;
+                }
+                line++;
+
+                // Row 3: A72 Cores
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "A72:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                cx = 8;
+                for (int i = 0; i < 4; ++i) {
+                    int bi = i + 4;
+                    double p = (bi < (int)core_cpus.size()) ? core_cpus[bi] : 0.0;
+                    int f = (bi < (int)cpu_freqs.size()) ? cpu_freqs[bi] : 0;
+                    attron(COLOR_PAIR(7));
+                    mvprintw(line, cx, "C%d:", bi);
+                    attroff(COLOR_PAIR(7));
+                    attron(get_color_by_load(p) | A_BOLD);
+                    mvprintw(line, cx + 3, "%2.0f%%", p);
+                    attroff(get_color_by_load(p) | A_BOLD);
+                    attron(COLOR_PAIR(6));
+                    mvprintw(line, cx + 6, "(%dM)", f);
+                    attroff(COLOR_PAIR(6));
+                    cx += 17;
+                }
+                line++;
+
+                // Row 4: GPU & NPU
+                attron(COLOR_PAIR(7) | A_BOLD);
+                mvprintw(line, 3, "GPU:");
+                attroff(COLOR_PAIR(7) | A_BOLD);
+                std::string gpu_st = engine.gpu_stress.load() ? "[RUN]" : "[IDLE]";
+                int gpu_col = engine.gpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(gpu_col);
+                mvprintw(line, 8, "%s", gpu_st.c_str());
+                attroff(gpu_col);
+                draw_bar(line, 15, 12, gpu_load, get_color_by_load(gpu_load));
+                attron(COLOR_PAIR(6));
+                mvprintw(line, 28, "%4dM", gpu_freq);
+                attroff(COLOR_PAIR(6));
+
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 34, "| NPU:");
+                attroff(COLOR_PAIR(7));
+                std::string npu_st = engine.npu_stress.load() ? "[RUN]" : "[IDLE]";
+                int npu_col = engine.npu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+                attron(npu_col);
+                mvprintw(line, 41, "%s", npu_st.c_str());
+                attroff(npu_col);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 48, "C0:%2.0f%% C1:%2.0f%%", npu_loads[0], npu_loads[1]);
+                attroff(COLOR_PAIR(7));
+                attron(COLOR_PAIR(6));
+                mvprintw(line, 62, "%4dM", npu_freq);
+                attroff(COLOR_PAIR(6));
+                attron(COLOR_PAIR(5) | A_BOLD);
+                mvprintw(line, 68, "G:%.0fC", thermals["gpu"]);
+                attroff(COLOR_PAIR(5) | A_BOLD);
+                line++;
+            }
+
+            // Spacing before Section 2
             line++;
 
-            // Module 3: 4-Port Gigabit LAN Status & Per-Port Ping Stats
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(line, 2, "[4-Port Gigabit LAN - Realtime Status & Per-Port Ping Stats]");
-            attroff(COLOR_PAIR(4) | A_BOLD);
-            line++;
+            // ====================================================================
+            // SECTION 2: 4-PORT GIGABIT ETHERNET & PING MONITOR
+            // ====================================================================
+            draw_section_banner(line++, w, 10, 1, "[5] 4-PORT GIGABIT ETHERNET", "Link Status & 100ms Ping EMC Monitor");
 
             for (int i = 0; i < 4; ++i) {
                 const auto& port = engine.net_ports[i];
                 attron(COLOR_PAIR(2));
-                mvprintw(line + i, 3, "%-19s", port.ch_name.c_str());
+                mvprintw(line + i, 3, "%-18s", port.ch_name.c_str());
                 attroff(COLOR_PAIR(2));
 
                 if (!port.enabled) {
@@ -2331,13 +2778,13 @@ int main(int argc, char* argv[]) {
                     attroff(COLOR_PAIR(3));
                 }
 
-                // IP suffix
-                attron(COLOR_PAIR(7));
                 std::string ip_suffix = port.current_ip;
                 size_t dot_pos = ip_suffix.rfind('.');
                 if (dot_pos != std::string::npos) ip_suffix = ip_suffix.substr(dot_pos);
                 else ip_suffix = "---";
-                mvprintw(line + i, 35, "%-4s |S:%-4llu R:%-4llu L:",
+
+                attron(COLOR_PAIR(7));
+                mvprintw(line + i, 35, "%-4s | S:%-4llu R:%-4llu Lost:",
                          ip_suffix.c_str(),
                          (unsigned long long)port.sent, (unsigned long long)port.recv);
                 attroff(COLOR_PAIR(7));
@@ -2363,17 +2810,7 @@ int main(int argc, char* argv[]) {
             }
             line += 4;
 
-            // Module 4: 4-LAN Ping & Loss Monitor (EMC Immunity)
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(line, 2, "[4-LAN Ping & Loss Monitor]");
-            attroff(COLOR_PAIR(4) | A_BOLD);
-
-            std::string emc_st = engine.emc_active.load() ? "[RUN 100ms]" : "[STANDBY]";
-            int emc_col = engine.emc_active.load() ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(2);
-            attron(emc_col);
-            mvprintw(line, 30, "%s", emc_st.c_str());
-            attroff(emc_col);
-
+            // Ping stats summary
             uint64_t tot_sent = engine.get_total_sent();
             uint64_t tot_recv = engine.get_total_recv();
             uint64_t tot_lost = engine.get_total_lost();
@@ -2399,134 +2836,185 @@ int main(int argc, char* argv[]) {
                     rate_col = COLOR_PAIR(1) | A_BOLD;
                 }
             }
-            attron(rate_col);
-            mvprintw(line, 42, "[%s]", rating.c_str());
-            attroff(rate_col);
 
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 58, "Tgt: %-15s", engine.emc_target_ip.c_str());
-            attroff(COLOR_PAIR(7));
-            line++;
+            std::string emc_st = engine.emc_active.load() ? "[RUN 100ms]" : "[STANDBY]";
+            int emc_col = engine.emc_active.load() ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(2);
 
-            // Ping stats row (Sent, Recv, Lost, Flaps, Latest Event)
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 3, "Sent:%-5llu Rcv:%-5llu Lost:",
-                     (unsigned long long)tot_sent,
-                     (unsigned long long)tot_recv);
-            attroff(COLOR_PAIR(7));
-
-            int lost_col = (tot_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
-            attron(lost_col);
-            mvprintw(line, 27, "%-4llu", (unsigned long long)tot_lost);
-            attroff(lost_col);
-
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 31, "(%4.1f%%) Flap:%-2llu | Ev:", tot_loss_pct, (unsigned long long)tot_flaps);
-            attroff(COLOR_PAIR(7));
-
-            attron(COLOR_PAIR(engine.emc_latest_event_color) | A_BOLD);
-            std::string disp_ev = engine.emc_latest_event;
-            int max_ev_len = w - 55;
-            if ((int)disp_ev.length() > max_ev_len) disp_ev = disp_ev.substr(0, max_ev_len);
-            mvprintw(line, 53, "%s", disp_ev.c_str());
-            attroff(COLOR_PAIR(engine.emc_latest_event_color) | A_BOLD);
-            line++;
-
-            // Module 5: Serial Unidirectional Transmission (RS232 + RS485 inline)
-            auto draw_serial_inline = [&](int y) {
-                bool a232 = engine.rs232.active.load();
-                uint64_t e232 = engine.rs232.err_frames.load();
-                double spd232 = engine.rs232.speed_kb.load();
-                std::string st232 = a232 ? "[RUN]" : "[IDLE]";
-                int c232 = a232 ? ((e232 == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
-
+            if (spacious) {
+                // Line 1: Header + Status + Rating + Target
                 attron(COLOR_PAIR(7) | A_BOLD);
-                mvprintw(y, 2, "RS232(S0->S1):");
+                mvprintw(line, 3, "EMC Ping:");
                 attroff(COLOR_PAIR(7) | A_BOLD);
-                attron(c232);
-                mvprintw(y, 17, "%s", st232.c_str());
-                attroff(c232);
-                attron(COLOR_PAIR(6) | A_BOLD);
-                mvprintw(y, 24, "%4.1fK/s", spd232);
-                attroff(COLOR_PAIR(6) | A_BOLD);
-                attron(c232);
-                mvprintw(y, 33, "(%lluE)", (unsigned long long)e232);
-                attroff(c232);
-
+                attron(emc_col);
+                mvprintw(line, 13, "%s", emc_st.c_str());
+                attroff(emc_col);
+                attron(rate_col);
+                mvprintw(line, 26, "[%s]", rating.c_str());
+                attroff(rate_col);
                 attron(COLOR_PAIR(7));
-                mvprintw(y, 39, "|");
+                mvprintw(line, 45, "Target IP: %-15s", engine.emc_target_ip.c_str());
                 attroff(COLOR_PAIR(7));
+                line++;
 
-                bool a485 = engine.rs485.active.load();
-                uint64_t e485 = engine.rs485.err_frames.load();
-                double spd485 = engine.rs485.speed_kb.load();
-                std::string st485 = a485 ? "[RUN]" : "[IDLE]";
-                int c485 = a485 ? ((e485 == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
-
+                // Line 2: Detailed Ping Stats
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 3, "Ping Stats: Sent:%-5llu Recv:%-5llu Lost:",
+                         (unsigned long long)tot_sent, (unsigned long long)tot_recv);
+                attroff(COLOR_PAIR(7));
+                int lost_col = (tot_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
+                attron(lost_col);
+                mvprintw(line, 44, "%-4llu", (unsigned long long)tot_lost);
+                attroff(lost_col);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 49, "(%4.1f%%) | Link Flaps:%-2llu", tot_loss_pct, (unsigned long long)tot_flaps);
+                attroff(COLOR_PAIR(7));
+                line++;
+            } else {
+                // Compact mode (single row, strictly fitted within 78 cols)
                 attron(COLOR_PAIR(7) | A_BOLD);
-                mvprintw(y, 41, "RS485(S2->S3):");
+                mvprintw(line, 3, "Ping:");
                 attroff(COLOR_PAIR(7) | A_BOLD);
-                attron(c485);
-                mvprintw(y, 56, "%s", st485.c_str());
-                attroff(c485);
-                attron(COLOR_PAIR(6) | A_BOLD);
-                mvprintw(y, 63, "%4.1fK/s", spd485);
-                attroff(COLOR_PAIR(6) | A_BOLD);
-                attron(c485);
-                mvprintw(y, 72, "(%lluE)", (unsigned long long)e485);
-                attroff(c485);
-            };
-            draw_serial_inline(line);
+                attron(emc_col);
+                mvprintw(line, 9, "%s", emc_st.c_str());
+                attroff(emc_col);
+                attron(rate_col);
+                mvprintw(line, 21, "[%s]", rating.c_str());
+                attroff(rate_col);
+                attron(COLOR_PAIR(7));
+                std::string short_tgt = engine.emc_target_ip;
+                mvprintw(line, 37, "Tgt:%-14s | S:%-4llu L:", short_tgt.c_str(), (unsigned long long)tot_sent);
+                attroff(COLOR_PAIR(7));
+                int lost_col = (tot_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
+                attron(lost_col);
+                mvprintw(line, 66, "%-3llu", (unsigned long long)tot_lost);
+                attroff(lost_col);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 70, "Flap:%-2llu", (unsigned long long)tot_flaps);
+                attroff(COLOR_PAIR(7));
+                line++;
+            }
+
+            if (spacious) {
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 3, "Latest Event: ");
+                attroff(COLOR_PAIR(7));
+                attron(COLOR_PAIR(engine.emc_latest_event_color) | A_BOLD);
+                std::string disp_ev = engine.emc_latest_event;
+                int max_ev_len = w - 18;
+                if ((int)disp_ev.length() > max_ev_len) disp_ev = disp_ev.substr(0, max_ev_len);
+                mvprintw(line, 17, "%s", disp_ev.c_str());
+                attroff(COLOR_PAIR(engine.emc_latest_event_color) | A_BOLD);
+                line++;
+            }
+
+            // Spacing before Section 3
             line++;
 
-            // Module 6: CAN0 <-> CAN1 Cross-Test (Mutual Transmission)
-            bool can_on = engine.can_tester.active.load();
-            uint64_t c0_err = engine.can_tester.c0_to_c1_err.load();
-            uint64_t c1_err = engine.can_tester.c1_to_c0_err.load();
-            uint64_t tot_can_err = c0_err + c1_err;
-            double c0_fps = engine.can_tester.c0_to_c1_fps.load();
-            double c1_fps = engine.can_tester.c1_to_c0_fps.load();
+            // ====================================================================
+            // SECTION 3: INDUSTRIAL FIELDBUS (SERIAL & CAN)
+            // ====================================================================
+            draw_section_banner(line++, w, 11, 2, "[6,7,9] INDUSTRIAL FIELDBUS", "RS232 / RS485 / CAN Bus Testing");
+
+            // Row 1: RS232 + RS485
+            bool a232 = engine.rs232.active.load();
+            uint64_t e232 = engine.rs232.err_frames.load();
+            double spd232 = engine.rs232.speed_kb.load();
+            std::string st232 = a232 ? "[RUN]" : "[IDLE]";
+            int c232 = a232 ? ((e232 == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
 
             attron(COLOR_PAIR(7) | A_BOLD);
-            mvprintw(line, 2, "CAN(0<->1):");
+            mvprintw(line, 3, "RS232(S0->S1):");
+            attroff(COLOR_PAIR(7) | A_BOLD);
+            attron(c232);
+            mvprintw(line, 18, "%s", st232.c_str());
+            attroff(c232);
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(line, 25, "%4.1fK/s", spd232);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+            attron(c232);
+            mvprintw(line, 34, "(%lluE)", (unsigned long long)e232);
+            attroff(c232);
+
+            attron(COLOR_PAIR(7));
+            mvprintw(line, 40, "|");
+            attroff(COLOR_PAIR(7));
+
+            bool a485 = engine.rs485.active.load();
+            uint64_t e485 = engine.rs485.err_frames.load();
+            double spd485 = engine.rs485.speed_kb.load();
+            std::string st485 = a485 ? "[RUN]" : "[IDLE]";
+            int c485 = a485 ? ((e485 == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
+
+            attron(COLOR_PAIR(7) | A_BOLD);
+            mvprintw(line, 42, "RS485(S2->S3):");
+            attroff(COLOR_PAIR(7) | A_BOLD);
+            attron(c485);
+            mvprintw(line, 57, "%s", st485.c_str());
+            attroff(c485);
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(line, 64, "%4.1fK/s", spd485);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+            attron(c485);
+            mvprintw(line, 73, "(%lluE)", (unsigned long long)e485);
+            attroff(c485);
+            line++;
+
+            // Row 2: CAN Bus
+            bool can_on = engine.can_tester.active.load();
+            uint64_t c_err = engine.can_tester.err_frames.load();
+            double c_tx_fps = engine.can_tester.tx_fps.load();
+            double c_rx_fps = engine.can_tester.rx_fps.load();
+            CanDirection c_dir = engine.can_tester.dir.load();
+
+            attron(COLOR_PAIR(7) | A_BOLD);
+            std::string dir_label = "CAN(0->1):";
+            if (c_dir == CanDirection::CAN1_TO_CAN0) dir_label = "CAN(1->0):";
+            else if (c_dir == CanDirection::PING_PONG) dir_label = "CAN(0<->1):";
+            mvprintw(line, 3, "%-11s", dir_label.c_str());
             attroff(COLOR_PAIR(7) | A_BOLD);
 
             std::string can_st = can_on ? "[RUN]" : "[IDLE]";
-            int can_col = can_on ? ((tot_can_err == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
+            int can_col = can_on ? ((c_err == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
             attron(can_col);
-            mvprintw(line, 14, "%s", can_st.c_str());
+            mvprintw(line, 15, "%s", can_st.c_str());
             attroff(can_col);
 
             attron(COLOR_PAIR(7));
-            mvprintw(line, 21, "c0->c1:%4.0fF/s", c0_fps);
+            if (c_dir == CanDirection::CAN0_TO_CAN1) {
+                mvprintw(line, 22, "TX(c0):%4.0fF/s", c_tx_fps);
+                mvprintw(line, 37, "|");
+                mvprintw(line, 39, "RX(c1):%4.0fF/s", c_rx_fps);
+            } else if (c_dir == CanDirection::CAN1_TO_CAN0) {
+                mvprintw(line, 22, "TX(c1):%4.0fF/s", c_tx_fps);
+                mvprintw(line, 37, "|");
+                mvprintw(line, 39, "RX(c0):%4.0fF/s", c_rx_fps);
+            } else {
+                mvprintw(line, 22, "Ping:%4.0fF/s", c_tx_fps);
+                mvprintw(line, 37, "|");
+                mvprintw(line, 39, "Pong:%4.0fF/s", c_rx_fps);
+            }
             attroff(COLOR_PAIR(7));
 
-            int c0_ecol = (c0_err == 0) ? (can_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(7)) : (COLOR_PAIR(3) | A_BOLD);
-            attron(c0_ecol);
-            mvprintw(line, 35, "(%lluE)", (unsigned long long)c0_err);
-            attroff(c0_ecol);
+            int err_col = (c_err == 0) ? (can_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(7)) : (COLOR_PAIR(3) | A_BOLD);
+            attron(err_col);
+            mvprintw(line, 55, "(%lluE)", (unsigned long long)c_err);
+            attroff(err_col);
 
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 42, "|");
-            attroff(COLOR_PAIR(7));
-
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 44, "c1->c0:%4.0fF/s", c1_fps);
-            attroff(COLOR_PAIR(7));
-
-            int c1_ecol = (c1_err == 0) ? (can_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(7)) : (COLOR_PAIR(3) | A_BOLD);
-            attron(c1_ecol);
-            mvprintw(line, 58, "(%lluE)", (unsigned long long)c1_err);
-            attroff(c1_ecol);
-
-            std::string can_tag = can_on ? ((tot_can_err == 0) ? "[PASS]" : "[ERR]") : "[IDLE]";
-            int tag_col = can_on ? ((tot_can_err == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
+            std::string can_tag = can_on ? ((c_err == 0) ? "[PASS]" : "[ERR]") : "[IDLE]";
+            int tag_col = can_on ? ((c_err == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD)) : COLOR_PAIR(7);
             attron(tag_col);
             mvprintw(line, 73, "%s", can_tag.c_str());
             attroff(tag_col);
             line++;
 
-            // Module 6: 4-Port USB Storage Stress
+            // Spacing before Section 4
+            line++;
+
+            // ====================================================================
+            // SECTION 4: 4-PORT HIGH-SPEED USB STORAGE
+            // ====================================================================
+            draw_section_banner(line++, w, 12, 6, "[8] 4-PORT USB STORAGE", "sda..sdd Read/Write Stress & Integrity");
+
             bool usb_on = engine.usb_tester.active.load();
             uint64_t usb_w_mb = engine.usb_tester.get_total_write_mb();
             uint64_t usb_r_mb = engine.usb_tester.get_total_read_mb();
@@ -2534,35 +3022,19 @@ int main(int argc, char* argv[]) {
             double usb_w_spd = engine.usb_tester.get_total_write_speed();
             double usb_r_spd = engine.usb_tester.get_total_read_speed();
 
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(line, 2, "[4-Port USB Storage Stress]");
-            attroff(COLOR_PAIR(4) | A_BOLD);
-
-            std::string usb_st = usb_on ? "[RUNNING]" : "[STANDBY]";
-            int usb_col = usb_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(2);
-            attron(usb_col);
-            mvprintw(line, 30, "%s", usb_st.c_str());
-            attroff(usb_col);
-
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 40, "W:%lluM (%3.0fM/s) R:%lluM (%3.0fM/s)",
-                     (unsigned long long)usb_w_mb, usb_w_spd,
-                     (unsigned long long)usb_r_mb, usb_r_spd);
-            attroff(COLOR_PAIR(7));
-
-            int u_err_col = (usb_errs == 0) ? (usb_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(7)) : (COLOR_PAIR(3) | A_BOLD);
-            std::string u_tag = usb_on ? ((usb_errs == 0) ? "[PASS]" : "[ERR]") : "[IDLE]";
-            attron(u_err_col);
-            mvprintw(line, 73, "%s", u_tag.c_str());
-            attroff(u_err_col);
-            line++;
-
-            // USB per-disk detailed breakdown (2 disks per line)
             auto draw_usb_disk_inline = [&](int y, int x, const UsbDiskInfo& d, bool is_first) {
                 if (!d.mounted) {
-                    attron(COLOR_PAIR(8));
-                    mvprintw(y, x, "%s%-3s: [UNPLUGGED / NO DEV]", is_first ? "* " : "", d.dev_name.c_str());
-                    attroff(COLOR_PAIR(8));
+                    if (d.errors.load() > 0) {
+                        attron(COLOR_PAIR(3) | A_BOLD);
+                        mvprintw(y, x, "%s%-3s: [DISCONNECTED (%lluE)]",
+                                 is_first ? "* " : "", d.dev_name.c_str(),
+                                 (unsigned long long)d.errors.load());
+                        attroff(COLOR_PAIR(3) | A_BOLD);
+                    } else {
+                        attron(COLOR_PAIR(8));
+                        mvprintw(y, x, "%s%-3s: [UNPLUGGED / NO DEV]", is_first ? "* " : "", d.dev_name.c_str());
+                        attroff(COLOR_PAIR(8));
+                    }
                     return;
                 }
 
@@ -2608,9 +3080,33 @@ int main(int argc, char* argv[]) {
                 }
             };
 
-            // Row 1 of USB: sda & sdb
+            // Row 1: Total USB summary
+            attron(COLOR_PAIR(7) | A_BOLD);
+            mvprintw(line, 3, "4-Disk Stress:");
+            attroff(COLOR_PAIR(7) | A_BOLD);
+
+            std::string usb_st = usb_on ? "[RUNNING]" : "[STANDBY]";
+            int usb_col = usb_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(2);
+            attron(usb_col);
+            mvprintw(line, 18, "%s", usb_st.c_str());
+            attroff(usb_col);
+
+            attron(COLOR_PAIR(7));
+            mvprintw(line, 28, "W:%-4lluM (%2.0fM/s) | R:%-4lluM (%2.0fM/s)",
+                     (unsigned long long)usb_w_mb, usb_w_spd,
+                     (unsigned long long)usb_r_mb, usb_r_spd);
+            attroff(COLOR_PAIR(7));
+
+            int u_err_col = (usb_errs == 0) ? (usb_on ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(7)) : (COLOR_PAIR(3) | A_BOLD);
+            std::string u_tag = usb_on ? ((usb_errs == 0) ? "[PASS]" : "[ERR]") : "[IDLE]";
+            attron(u_err_col);
+            mvprintw(line, 73, "%s", u_tag.c_str());
+            attroff(u_err_col);
+            line++;
+
+            // Row 2 of USB: sda & sdb
             if (engine.usb_tester.disks.size() >= 2) {
-                draw_usb_disk_inline(line, 2, *engine.usb_tester.disks[0], true);
+                draw_usb_disk_inline(line, 3, *engine.usb_tester.disks[0], true);
                 attron(COLOR_PAIR(7));
                 mvprintw(line, 40, "|");
                 attroff(COLOR_PAIR(7));
@@ -2618,9 +3114,9 @@ int main(int argc, char* argv[]) {
                 line++;
             }
 
-            // Row 2 of USB: sdc & sdd
+            // Row 3 of USB: sdc & sdd
             if (engine.usb_tester.disks.size() >= 4) {
-                draw_usb_disk_inline(line, 2, *engine.usb_tester.disks[2], true);
+                draw_usb_disk_inline(line, 3, *engine.usb_tester.disks[2], true);
                 attron(COLOR_PAIR(7));
                 mvprintw(line, 40, "|");
                 attroff(COLOR_PAIR(7));
@@ -2628,35 +3124,16 @@ int main(int argc, char* argv[]) {
                 line++;
             }
 
-            // Module 7: Memory & Temperature
-            double soc_t = thermals["soc"];
-            double big_t = thermals["bigcore"];
-            double gpu_t = thermals["gpu"];
-            double npu_t = thermals["npu"];
+            // Bottom Footer (Anchored cleanly)
+            int key_y = std::max(line, h - 2);
+            int status_y = std::max(line + 1, h - 1);
 
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvprintw(line, 2, "[RAM & Temp]");
-            attroff(COLOR_PAIR(4) | A_BOLD);
-            attron(COLOR_PAIR(7));
-            mvprintw(line, 15, "RAM: %3.1fG/%3.1fG", used_ram, tot_ram);
-            attroff(COLOR_PAIR(7));
-            draw_bar(line, 29, 10, ram_pct, get_color_by_load(ram_pct));
-
-            attron(COLOR_PAIR(5) | A_BOLD);
-            mvprintw(line, 42, "Temp: SoC:%.0fC Big:%.0fC GPU:%.0fC NPU:%.0fC",
-                     soc_t, big_t, gpu_t, npu_t);
-            attroff(COLOR_PAIR(5) | A_BOLD);
-            line++;
-
-            // Key Controls
             attron(COLOR_PAIR(2) | A_BOLD);
-            mvprintw(line, 2, "[Keys] [M]Menu [1..4]Stress [5]Ping [6]232 [7]485 [8]USB [9]CAN [T]IP [Q]Quit");
+            mvprintw(key_y, 2, "[Keys] [M]Menu [1..3]Stress [5]Ping [6]232 [7]485 [8]USB [9]CAN [D]Dir [Q]Quit");
             attroff(COLOR_PAIR(2) | A_BOLD);
-            line++;
 
-            // Bottom Status Prompt
             attron(COLOR_PAIR(7) | A_BOLD);
-            mvprintw(line, 2, "Status: %-70s", prompt_status.c_str());
+            mvprintw(status_y, 2, "Status: %-70s", prompt_status.c_str());
             attroff(COLOR_PAIR(7) | A_BOLD);
 
             refresh();
