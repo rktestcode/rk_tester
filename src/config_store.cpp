@@ -43,10 +43,10 @@ SavedConfig load_config(const std::string& path) {
         else if (k == "rs485") cfg.rs485 = (iv != 0);
         else if (k == "usb") cfg.usb = (iv != 0);
         else if (k == "can") cfg.can = (iv != 0);
-        else if (k == "eth0") cfg.ports[0] = (iv != 0);
-        else if (k == "eth1") cfg.ports[1] = (iv != 0);
-        else if (k == "eth2") cfg.ports[2] = (iv != 0);
-        else if (k == "eth3") cfg.ports[3] = (iv != 0);
+        else if (k == "lan0") cfg.ports[0] = (iv != 0);
+        else if (k == "lan1") cfg.ports[1] = (iv != 0);
+        else if (k == "lan2") cfg.ports[2] = (iv != 0);
+        else if (k == "lan3") cfg.ports[3] = (iv != 0);
         else if (k == "rs232_dir" && iv >= 0 && iv <= 2) cfg.rs232_dir = static_cast<SerialDirection>(iv);
         else if (k == "rs485_dir" && iv >= 0 && iv <= 2) cfg.rs485_dir = static_cast<SerialDirection>(iv);
         else if (k == "can_dir" && iv >= 0 && iv <= 2) cfg.can_dir = static_cast<CanDirection>(iv);
@@ -71,10 +71,10 @@ bool save_config_snapshot(const std::string& path, const SavedConfig& cfg) {
       << "rs485=" << (cfg.rs485 ? 1 : 0) << "\n"
       << "usb=" << (cfg.usb ? 1 : 0) << "\n"
       << "can=" << (cfg.can ? 1 : 0) << "\n"
-      << "eth0=" << (cfg.ports[0] ? 1 : 0) << "\n"
-      << "eth1=" << (cfg.ports[1] ? 1 : 0) << "\n"
-      << "eth2=" << (cfg.ports[2] ? 1 : 0) << "\n"
-      << "eth3=" << (cfg.ports[3] ? 1 : 0) << "\n"
+      << "lan0=" << (cfg.ports[0] ? 1 : 0) << "\n"
+      << "lan1=" << (cfg.ports[1] ? 1 : 0) << "\n"
+      << "lan2=" << (cfg.ports[2] ? 1 : 0) << "\n"
+      << "lan3=" << (cfg.ports[3] ? 1 : 0) << "\n"
       << "rs232_dir=" << static_cast<int>(cfg.rs232_dir) << "\n"
       << "rs485_dir=" << static_cast<int>(cfg.rs485_dir) << "\n"
       << "can_dir=" << static_cast<int>(cfg.can_dir) << "\n"

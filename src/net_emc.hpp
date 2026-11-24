@@ -17,9 +17,9 @@ struct SentPacket {
 };
 
 struct NetPortInfo {
-    std::string name;       // eth0, eth1, eth2, eth3
-    std::string ch_name;    // Port 1 (eth0->eth1)
-    std::string peer_name;  // eth1
+    std::string name;       // lan0, lan1, lan2, lan3
+    std::string ch_name;    // Port 1 (lan0->lan1)
+    std::string peer_name;  // lan1
     std::string local_ip;   // 192.168.10.1
     std::string peer_ip;    // 192.168.11.1
     std::string current_ip; // Current IP

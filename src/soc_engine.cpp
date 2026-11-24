@@ -318,55 +318,23 @@ std::string RkTesterEngine::toggle_gpu_stress() {
         return "GPU stress STOPPED.";
     }
 
-    // 1. 优先使用内置 Mali OpenCL 原生 GPU 计算压测（无需 X11/Wayland/glmark2，直接满频 900MHz 100%）
-    std::string ocl_lib = find_shared_lib({"libMaliOpenCL.so.1", "libOpenCL.so.1"});
-    if (!ocl_lib.empty() && access("/dev/mali0", R_OK | W_OK) == 0) {
-        std::string cur_gov = read_text_token(DEVFREQ_GPU + "/governor");
-        if (!cur_gov.empty() && cur_gov != "performance") {
-            saved_gpu_gov = cur_gov;
-            write_text_value(DEVFREQ_GPU + "/governor", "performance");
-            gpu_gov_boosted = true;
-        }
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            execl("/proc/self/exe", "rk_tester", "--internal-gpu-burn", nullptr);
-            _exit(127);
-        } else if (pid > 0) {
-            gpu_pid = pid;
-            gpu_stress.store(true);
-            return "Mali-G52 GPU OpenCL stress STARTED (900MHz full-freq).";
-        }
-        return "GPU stress failed to fork.";
+    // 内置 Mesa/Panfrost 无头 GBM + EGL + GLES 离屏着色器压测，直接满频运行
+    bool has_drm_gles = (!find_shared_lib({"libEGL.so.1"}).empty() &&
+                         !find_shared_lib({"libGLESv2.so.2"}).empty() &&
+                         !find_shared_lib({"libgbm.so.1"}).empty() &&
+                         (access("/dev/dri/by-path/platform-27800000.gpu-render", R_OK | W_OK) == 0 ||
+                          access("/dev/dri/renderD129", R_OK | W_OK) == 0 ||
+                          access("/dev/dri/renderD128", R_OK | W_OK) == 0));
+    if (!has_drm_gles) {
+        return "GPU unavailable: check Mesa EGL/GLES/GBM libs and /dev/dri/renderD* permissions.";
     }
 
-    // 2. 回退外部 glmark2 / kmscube
-    std::string gpu_bin;
-    bool use_glmark_args = true;
-    if (const char* env_bin = std::getenv("RK_GPU_BIN"); env_bin && env_bin[0] != '\0' && binary_in_path(env_bin)) {
-        gpu_bin = env_bin;
-        use_glmark_args = (gpu_bin.find("glmark2") != std::string::npos);
-    } else {
-        const char* cands[] = {"glmark2-es2-drm", "glmark2-es2-wayland", "glmark2-es2", "kmscube"};
-        for (const char* c : cands) {
-            if (binary_in_path(c)) {
-                gpu_bin = c;
-                use_glmark_args = (std::string(c).find("glmark2") != std::string::npos);
-                break;
-            }
-        }
+    std::string cur_gov = read_text_token(DEVFREQ_GPU + "/governor");
+    if (!cur_gov.empty() && cur_gov != "performance") {
+        saved_gpu_gov = cur_gov;
+        write_text_value(DEVFREQ_GPU + "/governor", "performance");
+        gpu_gov_boosted = true;
     }
-
-    if (gpu_bin.empty()) {
-        return "GPU unavailable: install libmali (OpenCL) or glmark2-es2-drm.";
-    }
-
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
@@ -376,16 +344,12 @@ std::string RkTesterEngine::toggle_gpu_stress() {
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        if (use_glmark_args) {
-            execlp(gpu_bin.c_str(), gpu_bin.c_str(), "--off-screen", "--run-forever", nullptr);
-        } else {
-            execlp(gpu_bin.c_str(), gpu_bin.c_str(), nullptr);
-        }
+        execl("/proc/self/exe", "rk_tester", "--internal-gpu-burn", nullptr);
         _exit(127);
     } else if (pid > 0) {
         gpu_pid = pid;
         gpu_stress.store(true);
-        return "Mali-G52 GPU stress STARTED (" + gpu_bin + ").";
+        return "Mali-G52 GPU Panfrost EGL/GLES stress STARTED (full-freq).";
     }
     return "GPU stress failed to fork.";
 }
@@ -400,7 +364,7 @@ std::string RkTesterEngine::check_stress_health() {
                 write_text_value(DEVFREQ_GPU + "/governor", saved_gpu_gov);
                 gpu_gov_boosted = false;
             }
-            return "GPU stress exited unexpectedly (check libmali / OpenCL / DRM).";
+            return "GPU stress exited unexpectedly (check Panfrost DRM / EGL / GLES).";
         }
     }
     if (npu_stress.load() && !npu_pids.empty()) {
@@ -460,104 +424,34 @@ std::string RkTesterEngine::toggle_npu_stress() {
         return "NPU stress STOPPED.";
     }
 
-    // 1. 优先使用内置 librknnrt.so 双核 MatMul 原生压测，并强制将 NPU 频率拉满至 950MHz
+    // 内置 librknnrt.so 双核 MatMul 原生压测，自动将 NPU 频率拉满至 950MHz
     std::string rknn_lib = find_shared_lib({"librknnrt.so"});
-    if (!rknn_lib.empty() && access(DEVFREQ_NPU.c_str(), F_OK) == 0) {
-        std::string cur_gov = read_text_token(DEVFREQ_NPU + "/governor");
-        if (!cur_gov.empty() && cur_gov != "performance") {
-            saved_npu_gov = cur_gov;
-            write_text_value(DEVFREQ_NPU + "/governor", "performance");
-            npu_gov_boosted = true;
-        }
-        npu_pids.clear();
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            execl("/proc/self/exe", "rk_tester", "--internal-npu-burn", nullptr);
-            _exit(127);
-        } else if (pid > 0) {
-            npu_pids.push_back(pid);
-            npu_stress.store(true);
-            return "RKNPU dual-core 6 TOPS MatMul stress STARTED (950MHz full-freq).";
-        }
-        return "NPU stress failed to fork.";
+    if (rknn_lib.empty() || access(DEVFREQ_NPU.c_str(), F_OK) != 0) {
+        return "NPU unavailable: check librknnrt.so and RKNPU driver.";
     }
 
-    // 2. 回退外部 rknn_common_test / rknn_benchmark
-    auto pick_file = [](const char* env_key, const std::vector<std::string>& cands, int mode) -> std::string {
-        if (const char* ev = std::getenv(env_key); ev && ev[0] != '\0' && access(ev, mode) == 0) {
-            return ev;
-        }
-        for (const auto& p : cands) {
-            if (access(p.c_str(), mode) == 0) return p;
-        }
-        return "";
-    };
-
-    std::string bin = pick_file("RK_NPU_BIN", {
-        RKNN_TEST_BIN, "/usr/local/bin/rknn_common_test",
-        "/usr/bin/rknn_benchmark", "/usr/local/bin/rknn_benchmark"
-    }, X_OK);
-    std::string model = pick_file("RK_NPU_MODEL", {
-        RKNN_MODEL, "/usr/share/model/mobilenet_v1.rknn",
-        "/usr/share/rknn_model_zoo/mobilenet_v1.rknn"
-    }, R_OK);
-    std::string img = pick_file("RK_NPU_IMG", {
-        RKNN_IMG, "/usr/share/rknn_model_zoo/dog_224x224.jpg"
-    }, R_OK);
-
-    bool is_benchmark = (bin.find("rknn_benchmark") != std::string::npos);
-    if (bin.empty() || model.empty() || (!is_benchmark && img.empty())) {
-        return "NPU unavailable: install librknnrt.so or rknn_common_test + .rknn model.";
+    std::string cur_gov = read_text_token(DEVFREQ_NPU + "/governor");
+    if (!cur_gov.empty() && cur_gov != "performance") {
+        saved_npu_gov = cur_gov;
+        write_text_value(DEVFREQ_NPU + "/governor", "performance");
+        npu_gov_boosted = true;
     }
-
     npu_pids.clear();
-    for (int i = 0; i < 2; ++i) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            while (true) {
-                auto t0 = std::chrono::steady_clock::now();
-                pid_t child = fork();
-                if (child == 0) {
-                    if (is_benchmark) {
-                        execl(bin.c_str(), bin.c_str(), model.c_str(), "500", nullptr);
-                    } else {
-                        execl(bin.c_str(), bin.c_str(), model.c_str(), img.c_str(), "500", nullptr);
-                    }
-                    _exit(127);
-                } else if (child > 0) {
-                    int st = 0;
-                    waitpid(child, &st, 0);
-                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          std::chrono::steady_clock::now() - t0)
-                                          .count();
-                    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || elapsed_ms < 100) {
-                        usleep(500000);
-                    }
-                } else {
-                    usleep(500000);
-                }
-            }
-        } else if (pid > 0) {
-            npu_pids.push_back(pid);
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
         }
-    }
-    if (!npu_pids.empty()) {
+        execl("/proc/self/exe", "rk_tester", "--internal-npu-burn", nullptr);
+        _exit(127);
+    } else if (pid > 0) {
+        npu_pids.push_back(pid);
         npu_stress.store(true);
-        return "RKNPU dual-core 6 TOPS stress STARTED.";
+        return "RKNPU dual-core 6 TOPS MatMul stress STARTED (950MHz full-freq).";
     }
     return "NPU stress failed to fork.";
 }
@@ -601,48 +495,27 @@ std::string RkTesterEngine::toggle_mpp_stress() {
     }
 
     std::string mpp_lib = find_shared_lib({"librockchip_mpp.so.1", "librockchip_mpp.so", "librockchip_mpp.so.0"});
-    if (!mpp_lib.empty() && access("/dev/mpp_service", R_OK | W_OK) == 0) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            execl("/proc/self/exe", "rk_tester", "--internal-mpp-burn", nullptr);
-            _exit(127);
-        } else if (pid > 0) {
-            mpp_pid = pid;
-            mpp_stress.store(true);
-            return "RKMPP dual-4K H.265 VENC+VDEC stress STARTED (native built-in).";
-        }
-        return "RKMPP stress failed to fork.";
+    if (mpp_lib.empty() || access("/dev/mpp_service", R_OK | W_OK) != 0) {
+        return "RKMPP unavailable: check librockchip_mpp.so and /dev/mpp_service.";
     }
 
-    // 回退外部 mpi_enc_test
-    if (binary_in_path("mpi_enc_test") && access("/dev/mpp_service", R_OK | W_OK) == 0) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-            execlp("mpi_enc_test", "mpi_enc_test", "-w", "3840", "-h", "2160", "-t", "16777220", "-n", "0", nullptr);
-            _exit(127);
-        } else if (pid > 0) {
-            mpp_pid = pid;
-            mpp_stress.store(true);
-            return "RKMPP 4K H.265 stress STARTED (mpi_enc_test).";
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
         }
-        return "RKMPP stress failed to fork.";
+        execl("/proc/self/exe", "rk_tester", "--internal-mpp-burn", nullptr);
+        _exit(127);
+    } else if (pid > 0) {
+        mpp_pid = pid;
+        mpp_stress.store(true);
+        return "RKMPP dual-4K H.265 VENC+VDEC stress STARTED (native built-in).";
     }
-
-    return "RKMPP unavailable: install librockchip_mpp.so and check /dev/mpp_service.";
+    return "RKMPP stress failed to fork.";
 }
 
 std::string RkTesterEngine::toggle_all_stress() {

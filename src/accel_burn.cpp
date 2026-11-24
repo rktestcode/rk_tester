@@ -88,24 +88,8 @@ struct RgaHandleParam {
 };
 static_assert(sizeof(RgaHandleParam) == 12, "RgaHandleParam ABI mismatch");
 
-struct RgaOpt {
-    uint32_t version;
-    int color;
-    RgaColorKeyRange colorkey_range;
-    RgaNn nn;
-    int rop_code;
-    int priority;
-    int core;
-    uint8_t tail[312 - 52];
-};
-static_assert(sizeof(RgaOpt) == 312, "RgaOpt ABI mismatch with librga");
-static_assert(offsetof(RgaOpt, core) == 48, "RgaOpt::core offset mismatch");
-
-constexpr uint32_t kRgaApiVersion = (1u << 24) | (10u << 16) | (6u << 8) | 3u;
 constexpr int kRgaFmtRgba8888 = 0x0 << 8;
 constexpr int kRgaFmtNv12 = 0xa << 8;
-constexpr int kRgaSchedRga2Core0 = 1 << 2;
-constexpr int kRgaSchedRga2Core1 = 1 << 3;
 constexpr int kRgaUsageRot180 = 1 << 1;
 constexpr int kRgaUsageSync = 1 << 19;
 constexpr int kRgaStatusSuccess = 1;
@@ -196,84 +180,234 @@ void fill_nv12_pattern(uint8_t* ptr, int w, int h, int phase) {
 
 } // namespace
 
-int run_internal_gpu_opencl_burn() {
-    using cl_int = int32_t;
-    using cl_uint = uint32_t;
-    using cl_ulong = uint64_t;
-    using cl_platform_id = void*;
-    using cl_device_id = void*;
-    using cl_context = void*;
-    using cl_command_queue = void*;
-    using cl_program = void*;
-    using cl_kernel = void*;
-    using cl_mem = void*;
-    constexpr cl_ulong kDevGpu = (1ULL << 2);
-    constexpr cl_ulong kMemRW = (1ULL << 0);
+int run_internal_gpu_burn() {
+    // 无头 Mesa/Panfrost GBM + EGL + OpenGL ES 2.0 离屏 FBO 着色器满载压测
+    void* lib_gbm = dlopen("libgbm.so.1", RTLD_NOW);
+    void* lib_egl = dlopen("libEGL.so.1", RTLD_NOW);
+    void* lib_gl = dlopen("libGLESv2.so.2", RTLD_NOW);
+    if (!lib_gbm || !lib_egl || !lib_gl) return 20;
 
-    void* lib = dlopen("libMaliOpenCL.so.1", RTLD_NOW);
-    if (!lib) lib = dlopen("/usr/lib/aarch64-linux-gnu/mali/libMaliOpenCL.so.1", RTLD_NOW);
-    if (!lib) lib = dlopen("libOpenCL.so.1", RTLD_NOW);
-    if (!lib) return 1;
+    auto pGbmCreate = reinterpret_cast<void*(*)(int)>(dlsym(lib_gbm, "gbm_create_device"));
+    auto pGbmDestroy = reinterpret_cast<void(*)(void*)>(dlsym(lib_gbm, "gbm_device_destroy"));
 
-    auto pGetPlat = reinterpret_cast<cl_int(*)(cl_uint, cl_platform_id*, cl_uint*)>(dlsym(lib, "clGetPlatformIDs"));
-    auto pGetDev = reinterpret_cast<cl_int(*)(cl_platform_id, cl_ulong, cl_uint, cl_device_id*, cl_uint*)>(dlsym(lib, "clGetDeviceIDs"));
-    auto pCreateCtx = reinterpret_cast<cl_context(*)(const void*, cl_uint, const cl_device_id*, void*, void*, cl_int*)>(dlsym(lib, "clCreateContext"));
-    auto pCreateQ = reinterpret_cast<cl_command_queue(*)(cl_context, cl_device_id, cl_ulong, cl_int*)>(dlsym(lib, "clCreateCommandQueue"));
-    auto pCreateBuf = reinterpret_cast<cl_mem(*)(cl_context, cl_ulong, size_t, void*, cl_int*)>(dlsym(lib, "clCreateBuffer"));
-    auto pCreateProg = reinterpret_cast<cl_program(*)(cl_context, cl_uint, const char**, const size_t*, cl_int*)>(dlsym(lib, "clCreateProgramWithSource"));
-    auto pBuildProg = reinterpret_cast<cl_int(*)(cl_program, cl_uint, const cl_device_id*, const char*, void*, void*)>(dlsym(lib, "clBuildProgram"));
-    auto pCreateKern = reinterpret_cast<cl_kernel(*)(cl_program, const char*, cl_int*)>(dlsym(lib, "clCreateKernel"));
-    auto pSetArg = reinterpret_cast<cl_int(*)(cl_kernel, cl_uint, size_t, const void*)>(dlsym(lib, "clSetKernelArg"));
-    auto pEnqND = reinterpret_cast<cl_int(*)(cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*, cl_uint, const void*, void*)>(dlsym(lib, "clEnqueueNDRangeKernel"));
-    auto pFinish = reinterpret_cast<cl_int(*)(cl_command_queue)>(dlsym(lib, "clFinish"));
-    if (!pGetPlat || !pGetDev || !pCreateCtx || !pCreateQ || !pCreateBuf ||
-        !pCreateProg || !pBuildProg || !pCreateKern || !pSetArg || !pEnqND || !pFinish) {
-        return 2;
+    using EGLDisplay = void*;
+    using EGLConfig = void*;
+    using EGLContext = void*;
+    using EGLSurface = void*;
+    using EGLint = int32_t;
+    using EGLenum = uint32_t;
+    using EGLBoolean = uint32_t;
+
+    auto pEglGetPlatDpy = reinterpret_cast<EGLDisplay(*)(EGLenum, void*, const intptr_t*)>(dlsym(lib_egl, "eglGetPlatformDisplay"));
+    auto pEglGetDpy = reinterpret_cast<EGLDisplay(*)(void*)>(dlsym(lib_egl, "eglGetDisplay"));
+    auto pEglInit = reinterpret_cast<EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*)>(dlsym(lib_egl, "eglInitialize"));
+    auto pEglBindApi = reinterpret_cast<EGLBoolean(*)(EGLenum)>(dlsym(lib_egl, "eglBindAPI"));
+    auto pEglChooseCfg = reinterpret_cast<EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*)>(dlsym(lib_egl, "eglChooseConfig"));
+    auto pEglCreateCtx = reinterpret_cast<EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*)>(dlsym(lib_egl, "eglCreateContext"));
+    auto pEglCreatePbuf = reinterpret_cast<EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*)>(dlsym(lib_egl, "eglCreatePbufferSurface"));
+    auto pEglMakeCur = reinterpret_cast<EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext)>(dlsym(lib_egl, "eglMakeCurrent"));
+    auto pEglTerm = reinterpret_cast<EGLBoolean(*)(EGLDisplay)>(dlsym(lib_egl, "eglTerminate"));
+
+    using GLuint = uint32_t;
+    using GLint = int32_t;
+    using GLenum = uint32_t;
+    using GLsizei = int32_t;
+    auto pCreateShader = reinterpret_cast<GLuint(*)(GLenum)>(dlsym(lib_gl, "glCreateShader"));
+    auto pShaderSrc = reinterpret_cast<void(*)(GLuint, GLsizei, const char* const*, const GLint*)>(dlsym(lib_gl, "glShaderSource"));
+    auto pCompileShader = reinterpret_cast<void(*)(GLuint)>(dlsym(lib_gl, "glCompileShader"));
+    auto pGetShaderiv = reinterpret_cast<void(*)(GLuint, GLenum, GLint*)>(dlsym(lib_gl, "glGetShaderiv"));
+    auto pCreateProg = reinterpret_cast<GLuint(*)()>(dlsym(lib_gl, "glCreateProgram"));
+    auto pAttachShader = reinterpret_cast<void(*)(GLuint, GLuint)>(dlsym(lib_gl, "glAttachShader"));
+    auto pLinkProg = reinterpret_cast<void(*)(GLuint)>(dlsym(lib_gl, "glLinkProgram"));
+    auto pGetProgiv = reinterpret_cast<void(*)(GLuint, GLenum, GLint*)>(dlsym(lib_gl, "glGetProgramiv"));
+    auto pUseProg = reinterpret_cast<void(*)(GLuint)>(dlsym(lib_gl, "glUseProgram"));
+    auto pGetAttrib = reinterpret_cast<GLint(*)(GLuint, const char*)>(dlsym(lib_gl, "glGetAttribLocation"));
+    auto pGetUniform = reinterpret_cast<GLint(*)(GLuint, const char*)>(dlsym(lib_gl, "glGetUniformLocation"));
+    auto pUniform1f = reinterpret_cast<void(*)(GLint, float)>(dlsym(lib_gl, "glUniform1f"));
+    auto pGenFB = reinterpret_cast<void(*)(GLsizei, GLuint*)>(dlsym(lib_gl, "glGenFramebuffers"));
+    auto pBindFB = reinterpret_cast<void(*)(GLenum, GLuint)>(dlsym(lib_gl, "glBindFramebuffer"));
+    auto pGenTex = reinterpret_cast<void(*)(GLsizei, GLuint*)>(dlsym(lib_gl, "glGenTextures"));
+    auto pBindTex = reinterpret_cast<void(*)(GLenum, GLuint)>(dlsym(lib_gl, "glBindTexture"));
+    auto pTexParam = reinterpret_cast<void(*)(GLenum, GLenum, GLint)>(dlsym(lib_gl, "glTexParameteri"));
+    auto pTexImg2D = reinterpret_cast<void(*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)>(dlsym(lib_gl, "glTexImage2D"));
+    auto pFBTex2D = reinterpret_cast<void(*)(GLenum, GLenum, GLenum, GLuint, GLint)>(dlsym(lib_gl, "glFramebufferTexture2D"));
+    auto pGenBuf = reinterpret_cast<void(*)(GLsizei, GLuint*)>(dlsym(lib_gl, "glGenBuffers"));
+    auto pBindBuf = reinterpret_cast<void(*)(GLenum, GLuint)>(dlsym(lib_gl, "glBindBuffer"));
+    auto pBufData = reinterpret_cast<void(*)(GLenum, ptrdiff_t, const void*, GLenum)>(dlsym(lib_gl, "glBufferData"));
+    auto pEnableVA = reinterpret_cast<void(*)(GLuint)>(dlsym(lib_gl, "glEnableVertexAttribArray"));
+    auto pVAPtr = reinterpret_cast<void(*)(GLuint, GLint, GLenum, uint8_t, GLsizei, const void*)>(dlsym(lib_gl, "glVertexAttribPointer"));
+    auto pViewport = reinterpret_cast<void(*)(GLint, GLint, GLsizei, GLsizei)>(dlsym(lib_gl, "glViewport"));
+    auto pDrawArrays = reinterpret_cast<void(*)(GLenum, GLint, GLsizei)>(dlsym(lib_gl, "glDrawArrays"));
+    auto pFinish = reinterpret_cast<void(*)()>(dlsym(lib_gl, "glFinish"));
+
+    if (!pGbmCreate || !pGbmDestroy || (!pEglGetPlatDpy && !pEglGetDpy) || !pEglInit || !pEglBindApi ||
+        !pEglChooseCfg || !pEglCreateCtx || !pEglMakeCur || !pEglTerm ||
+        !pCreateShader || !pShaderSrc || !pCompileShader || !pGetShaderiv ||
+        !pCreateProg || !pAttachShader || !pLinkProg || !pGetProgiv || !pUseProg ||
+        !pGetAttrib || !pGetUniform || !pUniform1f || !pGenFB || !pBindFB ||
+        !pGenTex || !pBindTex || !pTexParam || !pTexImg2D || !pFBTex2D ||
+        !pGenBuf || !pBindBuf || !pBufData || !pEnableVA || !pVAPtr ||
+        !pViewport || !pDrawArrays || !pFinish) {
+        return 21;
     }
 
-    cl_platform_id plat = nullptr;
-    cl_uint nplat = 0;
-    if (pGetPlat(1, &plat, &nplat) != 0 || nplat == 0) return 3;
+    const char* dri_cands[] = {
+        "/dev/dri/by-path/platform-27800000.gpu-render",
+        "/dev/dri/renderD129",
+        "/dev/dri/renderD128"
+    };
+    int drm_fd = -1;
+    for (const char* p : dri_cands) {
+        drm_fd = open(p, O_RDWR | O_CLOEXEC);
+        if (drm_fd >= 0) break;
+    }
+    if (drm_fd < 0) return 22;
 
-    cl_device_id dev = nullptr;
-    cl_uint ndev = 0;
-    if (pGetDev(plat, kDevGpu, 1, &dev, &ndev) != 0 || ndev == 0) return 4;
+    void* gbm = pGbmCreate(drm_fd);
+    if (!gbm) {
+        close(drm_fd);
+        return 23;
+    }
 
-    cl_int err = 0;
-    cl_context ctx = pCreateCtx(nullptr, 1, &dev, nullptr, nullptr, &err);
-    if (!ctx || err != 0) return 5;
-    cl_command_queue q = pCreateQ(ctx, dev, 0, &err);
-    if (!q || err != 0) return 6;
+    constexpr EGLenum kEglPlatGbm = 0x31D7;
+    constexpr EGLenum kEglApiGles = 0x30A0;
+    constexpr EGLint kEglRenderable = 0x3040;
+    constexpr EGLint kEglEs2Bit = 0x0004;
+    constexpr EGLint kEglSurfType = 0x3033;
+    constexpr EGLint kEglPbufBit = 0x0001;
+    constexpr EGLint kEglCtxVer = 0x3098;
+    constexpr EGLint kEglWidth = 0x3057;
+    constexpr EGLint kEglHeight = 0x3056;
+    constexpr EGLint kEglNone = 0x3038;
 
-    const size_t N = 262144;
-    cl_mem buf = pCreateBuf(ctx, kMemRW, N * sizeof(float), nullptr, &err);
-    if (!buf || err != 0) return 7;
+    EGLDisplay dpy = pEglGetPlatDpy ? pEglGetPlatDpy(kEglPlatGbm, gbm, nullptr) : pEglGetDpy(gbm);
+    if (!dpy || !pEglInit(dpy, nullptr, nullptr)) {
+        pGbmDestroy(gbm);
+        close(drm_fd);
+        return 24;
+    }
+    pEglBindApi(kEglApiGles);
 
-    const char* src =
-        "__kernel void gpu_burn(__global float* out) {"
-        "  int id = get_global_id(0);"
-        "  float4 a = (float4)((float)(id & 255) * 0.001f + 1.0f, 1.1f, 1.2f, 1.3f);"
-        "  float4 b = (float4)(1.0001f, 0.9999f, 1.0002f, 0.9998f);"
-        "  float4 c = (float4)(0.0001f, 0.0002f, 0.0003f, 0.0004f);"
-        "  for (int i = 0; i < 4096; ++i) {"
-        "    a = fma(a, b, c);"
-        "    if (a.x > 1000.0f) a *= 0.001f;"
-        "  }"
-        "  out[id] = a.x + a.y + a.z + a.w;"
+    EGLConfig cfg = nullptr;
+    EGLint ncfg = 0;
+    const EGLint cfg_attr[] = {kEglRenderable, kEglEs2Bit, kEglNone};
+    if (!pEglChooseCfg(dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg == 0) {
+        pEglTerm(dpy);
+        pGbmDestroy(gbm);
+        close(drm_fd);
+        return 25;
+    }
+
+    const EGLint ctx_attr[] = {kEglCtxVer, 2, kEglNone};
+    EGLContext ctx = pEglCreateCtx(dpy, cfg, nullptr, ctx_attr);
+    if (!ctx) {
+        pEglTerm(dpy);
+        pGbmDestroy(gbm);
+        close(drm_fd);
+        return 26;
+    }
+
+    EGLSurface surf = nullptr;
+    if (!pEglMakeCur(dpy, nullptr, nullptr, ctx)) {
+        const EGLint pbuf_cfg_attr[] = {kEglRenderable, kEglEs2Bit, kEglSurfType, kEglPbufBit, kEglNone};
+        if (pEglCreatePbuf && pEglChooseCfg(dpy, pbuf_cfg_attr, &cfg, 1, &ncfg) && ncfg > 0) {
+            const EGLint pb_attr[] = {kEglWidth, 64, kEglHeight, 64, kEglNone};
+            surf = pEglCreatePbuf(dpy, cfg, pb_attr);
+        }
+        if (!surf || !pEglMakeCur(dpy, surf, surf, ctx)) {
+            pEglTerm(dpy);
+            pGbmDestroy(gbm);
+            close(drm_fd);
+            return 27;
+        }
+    }
+
+    const char* vsrc =
+        "attribute vec2 aPos;"
+        "varying vec2 vUv;"
+        "void main() {"
+        "  vUv = aPos * 0.5 + 0.5;"
+        "  gl_Position = vec4(aPos, 0.0, 1.0);"
         "}";
-    cl_program prog = pCreateProg(ctx, 1, &src, nullptr, &err);
-    if (!prog || err != 0) return 8;
-    if (pBuildProg(prog, 1, &dev, "", nullptr, nullptr) != 0) return 9;
-    cl_kernel kern = pCreateKern(prog, "gpu_burn", &err);
-    if (!kern || err != 0) return 10;
-    if (pSetArg(kern, 0, sizeof(cl_mem), &buf) != 0) return 11;
+    const char* fsrc =
+        "precision highp float;"
+        "varying vec2 vUv;"
+        "uniform float uPhase;"
+        "void main() {"
+        "  vec4 a = vec4(vUv.x + 0.37, vUv.y + 0.61, uPhase + 0.23, 0.89);"
+        "  vec4 b = vec4(0.7519, 0.7523, 0.7517, 0.7521);"
+        "  vec4 c = vec4(0.3712, 0.4198, 0.3356, 0.4512);"
+        "  vec4 d = vec4(1.8734, 1.7923, 1.9145, 1.7456);"
+        "  for (int i = 0; i < 384; ++i) {"
+        "    a = a * b + c;"
+        "    a = d - a * b;"
+        "  }"
+        "  gl_FragColor = clamp(a * 0.5, 0.0, 1.0);"
+        "}";
 
+    GLuint vs = pCreateShader(0x8B31);
+    pShaderSrc(vs, 1, &vsrc, nullptr);
+    pCompileShader(vs);
+    GLint ok = 0;
+    pGetShaderiv(vs, 0x8B81, &ok);
+    if (!ok) return 28;
+
+    GLuint fs = pCreateShader(0x8B30);
+    pShaderSrc(fs, 1, &fsrc, nullptr);
+    pCompileShader(fs);
+    pGetShaderiv(fs, 0x8B81, &ok);
+    if (!ok) return 29;
+
+    GLuint prog = pCreateProg();
+    pAttachShader(prog, vs);
+    pAttachShader(prog, fs);
+    pLinkProg(prog);
+    pGetProgiv(prog, 0x8B82, &ok);
+    if (!ok) return 30;
+    pUseProg(prog);
+
+    // 1024x1024 离屏 FBO（100 万像素 x 384 次双 vec4 FMA/帧，直接将 Mali-G52 推至 100% 满频）
+    constexpr GLsizei kDim = 1024;
+    GLuint tex = 0, fbo = 0, vbo = 0;
+    pGenTex(1, &tex);
+    pBindTex(0x0DE1, tex);
+    pTexParam(0x0DE1, 0x2801, 0x2600);
+    pTexParam(0x0DE1, 0x2800, 0x2600);
+    pTexImg2D(0x0DE1, 0, 0x1908, kDim, kDim, 0, 0x1908, 0x1401, nullptr);
+    pGenFB(1, &fbo);
+    pBindFB(0x8D40, fbo);
+    pFBTex2D(0x8D40, 0x8CE0, 0x0DE1, tex, 0);
+
+    static const float quad[12] = {
+        -1.0f, -1.0f,  1.0f, -1.0f,  -1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f,  1.0f,  -1.0f,  1.0f
+    };
+    pGenBuf(1, &vbo);
+    pBindBuf(0x8892, vbo);
+    pBufData(0x8892, sizeof(quad), quad, 0x88E4);
+    GLint pos_loc = pGetAttrib(prog, "aPos");
+    GLint phase_loc = pGetUniform(prog, "uPhase");
+    if (pos_loc >= 0) {
+        pEnableVA(static_cast<GLuint>(pos_loc));
+        pVAPtr(static_cast<GLuint>(pos_loc), 2, 0x1406, 0, 0, nullptr);
+    }
+    pViewport(0, 0, kDim, kDim);
+
+    float phase = 0.1f;
     while (!g_quit_flag) {
         for (int r = 0; r < 4; ++r) {
-            if (pEnqND(q, kern, 1, nullptr, &N, nullptr, 0, nullptr, nullptr) != 0) return 12;
+            if (phase_loc >= 0) pUniform1f(phase_loc, phase);
+            pDrawArrays(0x0004, 0, 6);
+            phase += 0.013f;
+            if (phase > 1.0f) phase -= 1.0f;
         }
-        if (pFinish(q) != 0) return 13;
+        pFinish();
     }
+
+    pEglMakeCur(dpy, nullptr, nullptr, nullptr);
+    pEglTerm(dpy);
+    pGbmDestroy(gbm);
+    close(drm_fd);
     return 0;
 }
 
@@ -405,8 +539,8 @@ int run_internal_rga_burn() {
     auto pImportVa = reinterpret_cast<RgaBufHandle(*)(void*, RgaHandleParam*)>(dlsym(lib, "importbuffer_virtualaddr"));
     auto pRelease = reinterpret_cast<int(*)(RgaBufHandle)>(dlsym(lib, "releasebuffer_handle"));
     auto pWrapHandle = reinterpret_cast<RgaBuffer(*)(RgaBufHandle, int, int, int, int, int)>(dlsym(lib, "wrapbuffer_handle_t"));
-    auto pProcessOpt = reinterpret_cast<int(*)(RgaBuffer, RgaBuffer, RgaBuffer, RgaRect, RgaRect, RgaRect, int, int*, RgaOpt*, int)>(dlsym(lib, "improcessOpt"));
-    if (!pImportFd || !pImportVa || !pRelease || !pWrapHandle || !pProcessOpt) return 2;
+    auto pProcess = reinterpret_cast<int(*)(RgaBuffer, RgaBuffer, RgaBuffer, RgaRect, RgaRect, RgaRect, int)>(dlsym(lib, "improcess"));
+    if (!pImportFd || !pImportVa || !pRelease || !pWrapHandle || !pProcess) return 2;
 
     // 4K (3840x2160) RGBA8888 <-> NV12 旋转+色彩空间转换，同时压榨双核 RGA2 与 DDR 带宽
     constexpr int kW = 3840;
@@ -466,9 +600,9 @@ int run_internal_rga_burn() {
         }
     };
 
-    // 每个 RGA2 核心分配 2 个并发工作线程，消除 ioctl 提交间隔，稳定拉满双核 RGA2 至 95%~100%
+    // 启动 4 路并发工作线程，由内核 RGA 多核调度器自动均衡打满双核 RGA2 至 95%~100%
     std::atomic<bool> failed{false};
-    auto rga_worker = [&](int core_mask, uint8_t seed) {
+    auto rga_worker = [&](uint8_t seed) {
         RgaSurf rgba_a = alloc_surf(kW, kH, kRgaFmtRgba8888, kRgbaSize, static_cast<uint8_t>(0x35 + seed));
         RgaSurf nv12_b = alloc_surf(kW, kH, kRgaFmtNv12, kNv12Size, static_cast<uint8_t>(0x6A + seed));
         if (rgba_a.handle == 0 || nv12_b.handle == 0) {
@@ -481,24 +615,21 @@ int run_internal_rga_burn() {
         RgaBuffer empty_pat{};
         RgaRect full_rect{0, 0, kW, kH};
         RgaRect empty_rect{0, 0, 0, 0};
-        RgaOpt opt{};
-        opt.version = kRgaApiVersion;
-        opt.core = core_mask;
 
         while (!g_quit_flag) {
             // RGBA8888 -> NV12 (CSC + 180度旋转)
-            int r1 = pProcessOpt(rgba_a.buf, nv12_b.buf, empty_pat,
-                                 full_rect, full_rect, empty_rect,
-                                 -1, nullptr, &opt, kRgaUsageRot180 | kRgaUsageSync);
+            int r1 = pProcess(rgba_a.buf, nv12_b.buf, empty_pat,
+                              full_rect, full_rect, empty_rect,
+                              kRgaUsageRot180 | kRgaUsageSync);
             if (r1 != kRgaStatusSuccess) {
                 failed.store(true);
                 break;
             }
             if (g_quit_flag) break;
             // NV12 -> RGBA8888 (CSC + 180度旋转回环)
-            int r2 = pProcessOpt(nv12_b.buf, rgba_a.buf, empty_pat,
-                                 full_rect, full_rect, empty_rect,
-                                 -1, nullptr, &opt, kRgaUsageRot180 | kRgaUsageSync);
+            int r2 = pProcess(nv12_b.buf, rgba_a.buf, empty_pat,
+                              full_rect, full_rect, empty_rect,
+                              kRgaUsageRot180 | kRgaUsageSync);
             if (r2 != kRgaStatusSuccess) {
                 failed.store(true);
                 break;
@@ -509,10 +640,10 @@ int run_internal_rga_burn() {
         free_surf(nv12_b);
     };
 
-    std::thread t0(rga_worker, kRgaSchedRga2Core0, 1);
-    std::thread t1(rga_worker, kRgaSchedRga2Core0, 2);
-    std::thread t2(rga_worker, kRgaSchedRga2Core1, 3);
-    std::thread t3(rga_worker, kRgaSchedRga2Core1, 4);
+    std::thread t0(rga_worker, 1);
+    std::thread t1(rga_worker, 2);
+    std::thread t2(rga_worker, 3);
+    std::thread t3(rga_worker, 4);
     t0.join();
     t1.join();
     t2.join();

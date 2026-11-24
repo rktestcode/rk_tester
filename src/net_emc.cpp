@@ -113,23 +113,15 @@ void NetEmcTester::log_event(const std::string& level, const std::string& msg, i
 }
 
 void NetEmcTester::setup_default_network() {
-    if (access("/usr/local/sbin/nm-eth-names.sh", X_OK) == 0 && access("/sys/class/net/nm_i210", F_OK) == 0) {
-        if (system("/usr/local/sbin/nm-eth-names.sh >/dev/null 2>&1") < 0) {}
-    }
-
-    // 清理旧版同网段遗留 IP，避免与独立子网配置产生主路由冲突
-    if (system("ip addr del 192.168.10.2/24 dev eth1 2>/dev/null; "
-               "ip addr del 192.168.20.2/24 dev eth3 2>/dev/null") < 0) {}
-
     struct NetCfg {
         const char* iface;
         const char* ip;
         const char* brd;
     } cfgs[] = {
-        {"eth0", "192.168.10.1", "192.168.10.255"},
-        {"eth1", "192.168.11.1", "192.168.11.255"},
-        {"eth2", "192.168.20.1", "192.168.20.255"},
-        {"eth3", "192.168.21.1", "192.168.21.255"}
+        {"lan0", "192.168.10.1", "192.168.10.255"},
+        {"lan1", "192.168.11.1", "192.168.11.255"},
+        {"lan2", "192.168.20.1", "192.168.20.255"},
+        {"lan3", "192.168.21.1", "192.168.21.255"}
     };
 
     for (const auto& c : cfgs) {
@@ -149,10 +141,10 @@ void NetEmcTester::setup_default_network() {
 
 void NetEmcTester::init_net_ports() {
     net_ports.clear();
-    net_ports.emplace_back("eth0", "Port 1 (eth0->eth1)", "eth1", 1, "192.168.10.1", "192.168.11.1");
-    net_ports.emplace_back("eth1", "Port 2 (eth1->eth0)", "eth0", 0, "192.168.11.1", "192.168.10.1");
-    net_ports.emplace_back("eth2", "Port 3 (eth2->eth3)", "eth3", 3, "192.168.20.1", "192.168.21.1");
-    net_ports.emplace_back("eth3", "Port 4 (eth3->eth2)", "eth2", 2, "192.168.21.1", "192.168.20.1");
+    net_ports.emplace_back("lan0", "Port 1 (lan0->lan1)", "lan1", 1, "192.168.10.1", "192.168.11.1");
+    net_ports.emplace_back("lan1", "Port 2 (lan1->lan0)", "lan0", 0, "192.168.11.1", "192.168.10.1");
+    net_ports.emplace_back("lan2", "Port 3 (lan2->lan3)", "lan3", 3, "192.168.20.1", "192.168.21.1");
+    net_ports.emplace_back("lan3", "Port 4 (lan3->lan2)", "lan2", 2, "192.168.21.1", "192.168.20.1");
 }
 
 bool NetEmcTester::is_nonzero_mac(const uint8_t m[6]) {

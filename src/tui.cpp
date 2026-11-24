@@ -101,13 +101,13 @@ void print_usage() {
               << "  sudo rk_tester --rs485-2to3|3to2|pingpong  (Set RS485 direction)\n"
               << "  sudo rk_tester --can-0to1|1to0|pingpong    (Set CAN direction)\n\n"
               << "[Default 4-LAN Configurations (Dual-Pair Mutual Ping)]\n"
-              << "  Pair 1: Port 1 (eth0: 192.168.10.1/24) <-> Port 2 (eth1: 192.168.11.1/24)\n"
-              << "  Pair 2: Port 3 (eth2: 192.168.20.1/24) <-> Port 4 (eth3: 192.168.21.1/24)\n"
+              << "  Pair 1: Port 1 (lan0: 192.168.10.1/24) <-> Port 2 (lan1: 192.168.11.1/24)\n"
+              << "  Pair 2: Port 3 (lan2: 192.168.20.1/24) <-> Port 4 (lan3: 192.168.21.1/24)\n"
               << "  Engine: Layer-2 AF_PACKET raw frames (bypasses kernel loopback)\n\n"
               << "[Keyboard Controls]\n"
               << "  [M] Open Test Items Selection Menu (Interactive Checklist)\n"
               << "  [1] Toggle CPU 8-Core Compute Stress\n"
-              << "  [2] Toggle Mali-G52 GPU OpenCL Stress\n"
+              << "  [2] Toggle Mali-G52 GPU Panfrost EGL/GLES Stress\n"
               << "  [3] Toggle RKNPU Dual-Core 6 TOPS Neural MatMul Stress\n"
               << "  [0] Toggle RGA2 Dual-Core 4K 2D CSC/Rotate Stress\n"
               << "  [V] Toggle RKMPP Dual-4K H.265 VENC+VDEC Codec Stress\n"
@@ -133,7 +133,7 @@ void print_summary_report(const RkTesterEngine& engine) {
     std::cout << "\n====================================================================\n";
     std::cout << "      RK3576 Hardware Test Summary (4-LAN + Serial + CAN + USB)\n";
     std::cout << "====================================================================\n";
-    std::cout << " Test Mode          : Dual-Pair Mutual Ping (eth0 <-> eth1 & eth2 <-> eth3)\n";
+    std::cout << " Test Mode          : Dual-Pair Mutual Ping (lan0 <-> lan1 & lan2 <-> lan3)\n";
 
     double tot_loss_pct = (emc.total_sent > 0) ? (emc.total_lost * 100.0 / emc.total_sent) : 0.0;
 
@@ -496,8 +496,8 @@ bool handle_dashboard_input(int ch, RkTesterEngine& engine, UiState& ui) {
         bool next = !engine.net_emc.active.load();
         engine.net_emc.active.store(next);
         if (next) {
-            ui.prompt_status = "4-LAN Dual-Pair Mutual Ping STARTED (eth0<->eth1, eth2<->eth3).";
-            engine.log_emc_event("INFO", "4-LAN Dual-Pair Mutual Ping STARTED (eth0<->eth1, eth2<->eth3)", 1);
+            ui.prompt_status = "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3).";
+            engine.log_emc_event("INFO", "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3)", 1);
         } else {
             ui.prompt_status = "4-LAN ping monitoring PAUSED.";
             engine.log_emc_event("INFO", "4-LAN ping monitoring PAUSED.", 2);
@@ -578,12 +578,12 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     };
 
     MenuItem items[10] = {
-        {"[1]", "CPU 8-Core Compute Stress", "8-Core compute burn-in", ui.menu_cpu},
-        {"[2]", "Mali-G52 GPU OpenCL Stress", "Native OpenCL FMA burn-in", ui.menu_gpu},
+        {"[1]", "CPU 8-Core Compute Stress", "8-Core NEON+DDR burn-in", ui.menu_cpu},
+        {"[2]", "Mali-G52 GPU EGL/GLES", "Panfrost FBO shader burn", ui.menu_gpu},
         {"[3]", "RK-NPU Dual-Core AI Stress", "Dual-Core 6 TOPS MatMul", ui.menu_npu},
         {"[0]", "RK-RGA Dual-Core 2D Stress", "Dual-RGA2 4K CSC+Rotate", ui.menu_rga},
         {"[V]", "RK-MPP 4K Video Stress", "Dual-4K H.265 VENC+VDEC", ui.menu_mpp},
-        {"[5]", "4-LAN Dual-Pair Mutual Ping", "eth0<->eth1, eth2<->eth3", ui.menu_emc},
+        {"[5]", "4-LAN Dual-Pair Mutual Ping", "lan0<->lan1, lan2<->lan3", ui.menu_emc},
         {"[6]", "RS232 (" + engine.rs232.get_short_mode_name() + ")", engine.rs232.get_menu_desc(), ui.menu_rs232},
         {"[7]", "RS485 (" + engine.rs485.get_short_mode_name() + ")", engine.rs485.get_menu_desc(), ui.menu_rs485},
         {"[8]", "4-Port USB Storage Stress", "sda..sdd R/W & verify", ui.menu_usb},
@@ -641,7 +641,7 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     mvprintw(py, mx + 3, "LAN Ports Filter (LAN 0..3):");
     attroff(COLOR_PAIR(7) | A_BOLD);
 
-    const char* p_names[4] = {"eth0", "eth1", "eth2", "eth3"};
+    const char* p_names[4] = {"lan0", "lan1", "lan2", "lan3"};
     int px = mx + 36;
     for (int i = 0; i < 4; ++i) {
         bool is_sel = (ui.menu_cursor == 10 + i);
@@ -886,7 +886,7 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
     // SECTION 2: 4-PORT GIGABIT ETHERNET & PING MONITOR
     // ========================================================================
     EmcSnapshot emc = engine.get_emc_snapshot();
-    draw_section_banner(line++, w, 10, 1, "[5] 4-PORT GIGABIT ETHERNET", "eth0<->eth1 & eth2<->eth3 Mutual Ping");
+    draw_section_banner(line++, w, 10, 1, "[5] 4-PORT GIGABIT ETHERNET", "lan0<->lan1 & lan2<->lan3 Mutual Ping");
 
     for (size_t i = 0; i < emc.ports.size() && i < 4; ++i) {
         const auto& port = emc.ports[i];
@@ -962,7 +962,7 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "Mutual Ping:"); attroff(COLOR_PAIR(7) | A_BOLD);
         attron(emc_col); mvprintw(line, 16, "%s", emc_st); attroff(emc_col);
         attron(rate_col); mvprintw(line, 29, "[%s]", rating.c_str()); attroff(rate_col);
-        attron(COLOR_PAIR(7)); mvprintw(line, 47, "Pairs: eth0<->eth1 | eth2<->eth3"); attroff(COLOR_PAIR(7));
+        attron(COLOR_PAIR(7)); mvprintw(line, 47, "Pairs: lan0<->lan1 | lan2<->lan3"); attroff(COLOR_PAIR(7));
         line++;
 
         attron(COLOR_PAIR(7));

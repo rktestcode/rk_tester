@@ -26,7 +26,7 @@ int main(int argc, char* argv[]) {
         if (arg == "--internal-gpu-burn") {
             signal(SIGTERM, sig_handler);
             signal(SIGINT, sig_handler);
-            return run_internal_gpu_opencl_burn();
+            return run_internal_gpu_burn();
         } else if (arg == "--internal-npu-burn") {
             signal(SIGTERM, sig_handler);
             signal(SIGINT, sig_handler);

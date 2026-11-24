@@ -15,9 +15,6 @@ const std::string DEBUG_RKRGA_LOAD = "/sys/kernel/debug/rkrga/load";
 const std::string DEBUG_CLK_RGA = "/sys/kernel/debug/clk/clk_core_rga2e_0/clk_rate";
 const std::string DEBUG_CLK_VENC = "/sys/kernel/debug/clk/clk_vepu0_core/clk_rate";
 const std::string DEBUG_CLK_VDEC = "/sys/kernel/debug/clk/clk_rkvdec_core/clk_rate";
-const std::string RKNN_TEST_BIN = "/usr/bin/rknn_common_test";
-const std::string RKNN_MODEL = "/usr/share/model/RK3576/mobilenet_v1.rknn";
-const std::string RKNN_IMG = "/usr/share/model/dog_224x224.jpg";
 
 volatile sig_atomic_t g_quit_flag = 0;
 
@@ -65,25 +62,8 @@ std::string get_time_str() {
     return ss.str();
 }
 
-bool binary_in_path(const std::string& bin_name) {
-    if (bin_name.find('/') != std::string::npos) {
-        return access(bin_name.c_str(), X_OK) == 0;
-    }
-    const char* path_env = std::getenv("PATH");
-    if (!path_env) return false;
-    std::stringstream ss(path_env);
-    std::string dir;
-    while (std::getline(ss, dir, ':')) {
-        if (dir.empty()) dir = ".";
-        std::string full = dir + "/" + bin_name;
-        if (access(full.c_str(), X_OK) == 0) return true;
-    }
-    return false;
-}
-
 std::string find_shared_lib(const std::vector<std::string>& names) {
     static const char* dirs[] = {
-        "/usr/lib/aarch64-linux-gnu/mali/",
         "/usr/lib/aarch64-linux-gnu/",
         "/lib/aarch64-linux-gnu/",
         "/usr/local/lib/",
