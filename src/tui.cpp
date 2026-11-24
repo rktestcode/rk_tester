@@ -17,6 +17,7 @@ void UiState::sync_menu_from_engine(const RkTesterEngine& engine) {
     menu_npu = engine.npu_stress.load();
     menu_rga = engine.rga_stress.load();
     menu_mpp = engine.mpp_stress.load();
+    menu_ddr = engine.ddr_tester.active.load();
     menu_emc = engine.net_emc.active.load();
     menu_rs232 = engine.rs232.active.load();
     menu_rs485 = engine.rs485.active.load();
@@ -33,6 +34,7 @@ void UiState::sync_menu_from_config(const SavedConfig& cfg) {
     menu_npu = cfg.npu;
     menu_rga = cfg.rga;
     menu_mpp = cfg.mpp;
+    menu_ddr = cfg.ddr;
     menu_emc = cfg.emc;
     menu_rs232 = cfg.rs232;
     menu_rs485 = cfg.rs485;
@@ -43,7 +45,8 @@ void UiState::sync_menu_from_config(const SavedConfig& cfg) {
 
 void UiState::apply_menu(RkTesterEngine& engine) {
     std::string warn;
-    if (menu_cpu != engine.cpu_stress.load()) engine.toggle_cpu_stress();
+    // 启动顺序：先 fork 独立硬件压测子进程（GPU/NPU/RGA/MPP/DDR），再启外设线程，最后启本进程 CPU 8 核线程，
+    // 彻底避免 fork/pthread_create 争抢 mmap_lock 导致界面卡顿
     if (menu_gpu != engine.gpu_stress.load()) {
         std::string msg = engine.toggle_gpu_stress();
         if (menu_gpu && !engine.gpu_stress.load()) warn += " | " + msg;
@@ -60,10 +63,17 @@ void UiState::apply_menu(RkTesterEngine& engine) {
         std::string msg = engine.toggle_mpp_stress();
         if (menu_mpp && !engine.mpp_stress.load()) warn += " | " + msg;
     }
+    if (menu_ddr != engine.ddr_tester.active.load()) {
+        std::string msg = engine.toggle_ddr_stress();
+        if (menu_ddr && !engine.ddr_tester.active.load()) warn += " | " + msg;
+    }
     if (menu_emc != engine.net_emc.active.load()) {
         engine.net_emc.active.store(menu_emc);
         if (menu_emc) {
-            engine.log_emc_event("INFO", "4-LAN Dual-Pair Mutual Ping STARTED from Menu", 1);
+            std::string m = engine.net_emc.high_load.load()
+                                ? "4-LAN High-Load Burst (1480B) STARTED from Menu"
+                                : "4-LAN Dual-Pair Mutual Ping STARTED from Menu";
+            engine.log_emc_event("INFO", m, 1);
         } else {
             engine.log_emc_event("INFO", "4-LAN Ping test PAUSED from Menu", 2);
         }
@@ -72,6 +82,7 @@ void UiState::apply_menu(RkTesterEngine& engine) {
     if (menu_rs485 != engine.rs485.active.load()) engine.toggle_rs485();
     if (menu_usb != engine.usb_tester.active.load()) engine.toggle_usb_stress();
     if (menu_can != engine.can_tester.active.load()) engine.toggle_can();
+    if (menu_cpu != engine.cpu_stress.load()) engine.toggle_cpu_stress();
     for (size_t i = 0; i < 4; ++i) {
         engine.set_port_enabled(i, menu_ports[i]);
     }
@@ -82,7 +93,8 @@ void UiState::apply_menu(RkTesterEngine& engine) {
 
     int active_cnt = (engine.cpu_stress.load() ? 1 : 0) + (engine.gpu_stress.load() ? 1 : 0) +
                      (engine.npu_stress.load() ? 1 : 0) + (engine.rga_stress.load() ? 1 : 0) +
-                     (engine.mpp_stress.load() ? 1 : 0) + (engine.net_emc.active.load() ? 1 : 0) +
+                     (engine.mpp_stress.load() ? 1 : 0) + (engine.ddr_tester.active.load() ? 1 : 0) +
+                     (engine.net_emc.active.load() ? 1 : 0) +
                      (engine.rs232.active.load() ? 1 : 0) + (engine.rs485.active.load() ? 1 : 0) +
                      (engine.usb_tester.active.load() ? 1 : 0) + (engine.can_tester.active.load() ? 1 : 0);
     prompt_status = "Saved & applied: " + std::to_string(active_cnt) + " active" + warn;
@@ -97,10 +109,13 @@ void print_usage() {
               << "  sudo rk_tester                    (Launch & auto-restore last selection)\n"
               << "  sudo rk_tester -m                 (Open Menu pre-filled with last selection)\n"
               << "  sudo rk_tester --no-restore       (Launch clean standby without restoring)\n"
+              << "  sudo rk_tester --keep-isolcpus    (Leave RT isolated CPUs e.g. 6-7 unburned)\n"
+              << "  sudo rk_tester --lan-highload     (Start 4-LAN in 1480B Gigabit Burst mode)\n"
+              << "  sudo rk_tester --can-fd           (Start CAN in 64B 2Mbps CAN-FD stress mode)\n"
               << "  sudo rk_tester --rs232-0to1|1to0|pingpong  (Set RS232 direction)\n"
               << "  sudo rk_tester --rs485-2to3|3to2|pingpong  (Set RS485 direction)\n"
               << "  sudo rk_tester --can-0to1|1to0|pingpong    (Set CAN direction)\n\n"
-              << "[Default 4-LAN Configurations (Dual-Pair Mutual Ping)]\n"
+              << "[Default 4-LAN Configurations (Dual-Pair Mutual Ping / Burst)]\n"
               << "  Pair 1: Port 1 (lan0: 192.168.10.1/24) <-> Port 2 (lan1: 192.168.11.1/24)\n"
               << "  Pair 2: Port 3 (lan2: 192.168.20.1/24) <-> Port 4 (lan3: 192.168.21.1/24)\n"
               << "  Engine: Layer-2 AF_PACKET raw frames (bypasses kernel loopback)\n\n"
@@ -111,12 +126,15 @@ void print_usage() {
               << "  [3] Toggle RKNPU Dual-Core 6 TOPS Neural MatMul Stress\n"
               << "  [0] Toggle RGA2 Dual-Core 4K 2D CSC/Rotate Stress\n"
               << "  [V] Toggle RKMPP Dual-4K H.265 VENC+VDEC Codec Stress\n"
-              << "  [4] [ALL STRESS] Full Load on CPU + GPU + NPU + RGA + RKMPP\n"
-              << "  [5] Toggle 4-LAN Dual-Pair Mutual Ping Monitor (100ms)\n"
+              << "  [B] Toggle Large-Capacity DDR Bandwidth & Bit-Flip Stress\n"
+              << "  [4] [ALL STRESS] Full Load on CPU + GPU + NPU + RGA + RKMPP + DDR\n"
+              << "  [5] Toggle 4-LAN Dual-Pair Mutual Ping / Gigabit Burst\n"
+              << "  [T] Toggle 4-LAN Mode (100ms EMC Monitor <-> 1480B Gigabit Burst)\n"
               << "  [6] Toggle RS232 Serial Test (ttyS0 / ttyS1)\n"
               << "  [7] Toggle RS485 Serial Test (ttyS2 / ttyS3)\n"
-              << "  [8] Toggle 4-Port USB Storage Read/Write Stress (sda..sdd)\n"
+              << "  [8] Toggle 4-Port USB Storage 4MB O_DIRECT R/W Stress (sda..sdd)\n"
               << "  [9] Toggle CAN Bus Test (can0 / can1)\n"
+              << "  [F] Toggle CAN Mode (CAN 2.0 8B 50fps <-> CAN-FD 64B 2Mbps 500fps)\n"
               << "  [Z] Switch RS232 Direction (S0->S1 / S1->S0 / Ping-Pong)\n"
               << "  [X] Switch RS485 Direction (S2->S3 / S3->S2 / Ping-Pong)\n"
               << "  [D] Switch CAN Direction   (c0->c1 / c1->c0 / Ping-Pong)\n"
@@ -133,7 +151,10 @@ void print_summary_report(const RkTesterEngine& engine) {
     std::cout << "\n====================================================================\n";
     std::cout << "      RK3576 Hardware Test Summary (4-LAN + Serial + CAN + USB)\n";
     std::cout << "====================================================================\n";
-    std::cout << " Test Mode          : Dual-Pair Mutual Ping (lan0 <-> lan1 & lan2 <-> lan3)\n";
+    std::cout << " Test Mode          : Dual-Pair "
+              << (emc.high_load ? "High-Load Gigabit Burst (1480B, lan0<->lan1 & lan2<->lan3)"
+                                : "Mutual Ping (100ms EMC, lan0<->lan1 & lan2<->lan3)")
+              << "\n";
 
     double tot_loss_pct = (emc.total_sent > 0) ? (emc.total_lost * 100.0 / emc.total_sent) : 0.0;
 
@@ -161,6 +182,9 @@ void print_summary_report(const RkTesterEngine& engine) {
                  static_cast<unsigned long long>(p.lost),
                  p_loss, static_cast<unsigned long long>(p.flaps), avg_rtt);
         std::cout << buf;
+        if (p.hw_rx_err > 0 || p.hw_tx_err > 0 || p.hw_rx_drop > 0) {
+            std::cout << " [HW err r=" << p.hw_rx_err << "/t=" << p.hw_tx_err << "/d=" << p.hw_rx_drop << "]";
+        }
         if (!p.enabled) {
             std::cout << " [DISABLED]\n";
         } else if (!p.carrier && p.sent == 0) {
@@ -183,6 +207,9 @@ void print_summary_report(const RkTesterEngine& engine) {
         uint64_t rx_f = sc.rx_frames.load();
         uint64_t err_f = sc.err_frames.load();
         uint64_t crc_f = sc.crc_errors.load();
+        uint64_t oe_c = sc.hw_oe.load();
+        uint64_t fe_c = sc.hw_fe.load();
+        uint64_t pe_c = sc.hw_pe.load();
         double loss_pct = (tx_f > 0) ? (err_f * 100.0 / tx_f) : 0.0;
         double avg_rtt = (rx_f > 0) ? (sc.rtt_sum_ms.load() / rx_f) : 0.0;
         double max_rtt = sc.rtt_max_ms.load();
@@ -196,14 +223,17 @@ void print_summary_report(const RkTesterEngine& engine) {
             std::cout << "   - Status   : [NOT TESTED]\n";
             return;
         }
-        char buf[256];
+        char buf[320];
         snprintf(buf, sizeof(buf),
                  "   - Traffic  : TX: %.1f KB (%llu pkts) | RX: %.1f KB (%llu pkts)\n"
-                 "   - Integrity: Loss/Err: %llu (%4.1f%%) | CRC Err: %llu | RTT Avg/Max: %.1f/%.1f ms",
+                 "   - Integrity: Loss/Err: %llu (%4.1f%%) | CRC Err: %llu | HW(oe/fe/pe): %llu/%llu/%llu | RTT Avg/Max: %.1f/%.1f ms",
                  tx_kb, static_cast<unsigned long long>(tx_f),
                  rx_kb, static_cast<unsigned long long>(rx_f),
                  static_cast<unsigned long long>(err_f), loss_pct,
                  static_cast<unsigned long long>(crc_f),
+                 static_cast<unsigned long long>(oe_c),
+                 static_cast<unsigned long long>(fe_c),
+                 static_cast<unsigned long long>(pe_c),
                  avg_rtt, max_rtt);
         std::cout << buf;
         if (err_f == 0 && crc_f == 0 && rx_f > 0) {
@@ -216,7 +246,8 @@ void print_summary_report(const RkTesterEngine& engine) {
     print_serial_summary(engine.rs485);
 
     std::cout << "--------------------------------------------------------------------\n";
-    std::cout << " CAN Bus (can0 / can1) Transmission Summary (" << engine.can_tester.get_bitrate_info() << ", 8B Frame):\n";
+    std::cout << " CAN Bus (can0 / can1) Transmission Summary (" << engine.can_tester.get_bitrate_info()
+              << ", " << (engine.can_tester.fd_mode.load() ? "64B CAN-FD Frame" : "8B Frame") << "):\n";
     std::string mode_str = engine.can_tester.get_mode_name();
     uint64_t can_tx = engine.can_tester.tx_frames.load();
     uint64_t can_rx = engine.can_tester.rx_frames.load();
@@ -302,13 +333,35 @@ void print_summary_report(const RkTesterEngine& engine) {
     else std::cout << " [NOT TESTED]\n";
 
     std::cout << "--------------------------------------------------------------------\n";
+    uint64_t ddr_bytes = engine.ddr_tester.get_bytes_tested();
+    uint64_t ddr_alloc = engine.ddr_tester.get_alloc_mb();
+    uint64_t ddr_passes = engine.ddr_tester.get_passes();
+    uint64_t ddr_errs = engine.ddr_tester.get_bit_errors();
+    if (ddr_bytes > 0 || ddr_alloc > 0) {
+        double ddr_gb = static_cast<double>(ddr_bytes) / (1024.0 * 1024.0 * 1024.0);
+        char dbuf[192];
+        snprintf(dbuf, sizeof(dbuf),
+                 " DDR Memory Stress  : Region: %llu MB | Tested: %.2f GB (%llu passes) | Bit Errors: %llu %s\n",
+                 static_cast<unsigned long long>(ddr_alloc), ddr_gb,
+                 static_cast<unsigned long long>(ddr_passes),
+                 static_cast<unsigned long long>(ddr_errs),
+                 (ddr_errs == 0 && ddr_bytes > 0) ? "[PASS]" : "[FAIL]");
+        std::cout << dbuf;
+    }
     auto [mpp_enc_tot, mpp_dec_tot] = engine.get_mpp_session_frames();
     if (mpp_enc_tot > 0 || mpp_dec_tot > 0) {
         std::cout << " RKMPP Video Codec  : Hardware Encoded: " << mpp_enc_tot
                   << " frames | Hardware Decoded: " << mpp_dec_tot << " frames\n";
     }
     std::cout << " Total LAN Ping Sent: " << emc.total_sent << " packets | Received: " << emc.total_recv
-              << " | Lost: " << emc.total_lost << " (" << std::fixed << std::setprecision(1) << tot_loss_pct << " %)\n";
+              << " | Lost: " << emc.total_lost << " (" << std::fixed << std::setprecision(1) << tot_loss_pct << " %)";
+    if (emc.total_tx_bytes > 0 || emc.total_rx_bytes > 0) {
+        double tx_mb = static_cast<double>(emc.total_tx_bytes) / (1024.0 * 1024.0);
+        double rx_mb = static_cast<double>(emc.total_rx_bytes) / (1024.0 * 1024.0);
+        std::cout << " | TX: " << std::fixed << std::setprecision(1) << tx_mb
+                  << " MB / RX: " << rx_mb << " MB";
+    }
+    std::cout << "\n";
     std::cout << " Detailed Log Path  : " << engine.net_emc.log_path << "\n";
     std::cout << "====================================================================\n\n";
 }
@@ -345,18 +398,29 @@ void draw_bar(int y, int x, int width, double percent, int color_pair) {
 
 void draw_section_banner(int y, int w, int badge_pair, int line_pair, const char* badge, const char* subinfo = "") {
     int x = 2;
+    // 无色块背景：使用终端默认背景 + 高对比度粗体彩色标题，避免黑/灰字贴亮底看不清
+    attron(COLOR_PAIR(line_pair));
+    mvprintw(y, x, "== ");
+    attroff(COLOR_PAIR(line_pair));
+    x += 3;
+
     attron(COLOR_PAIR(badge_pair) | A_BOLD);
-    mvprintw(y, x, " %s ", badge);
+    mvprintw(y, x, "%s", badge);
     attroff(COLOR_PAIR(badge_pair) | A_BOLD);
-    x += static_cast<int>(std::strlen(badge)) + 2;
+    x += static_cast<int>(std::strlen(badge));
+
+    attron(COLOR_PAIR(line_pair));
+    mvprintw(y, x, " ==");
+    attroff(COLOR_PAIR(line_pair));
+    x += 3;
 
     if (subinfo && std::strlen(subinfo) > 0 && x + 4 < w - 2) {
         mvprintw(y, x, " ");
         x += 1;
         int max_sub = std::max(0, w - 3 - x);
-        attron(COLOR_PAIR(7) | A_BOLD);
+        attron(COLOR_PAIR(7));
         mvprintw(y, x, "%.*s", max_sub, subinfo);
-        attroff(COLOR_PAIR(7) | A_BOLD);
+        attroff(COLOR_PAIR(7));
         x += std::min(static_cast<int>(std::strlen(subinfo)), max_sub);
         if (x < w - 2) {
             mvprintw(y, x, " ");
@@ -379,7 +443,7 @@ int get_color_by_load(double pct) {
 
 // 返回 true 表示请求退出程序
 bool handle_menu_input(int ch, RkTesterEngine& engine, UiState& ui) {
-    constexpr int kMenuItems = 16; // 0..9 test items, 10..13 LAN filter, 14 Apply, 15 Cancel
+    constexpr int kMenuItems = 17; // 0..10 test items, 11..14 LAN filter, 15 Apply, 16 Cancel
     if (ch == 'q' || ch == 'Q') {
         return true;
     } else if (ch == 27 || ch == 'm' || ch == 'M') {
@@ -390,25 +454,26 @@ bool handle_menu_input(int ch, RkTesterEngine& engine, UiState& ui) {
     } else if (ch == KEY_DOWN || ch == 'j' || ch == 'J') {
         ui.menu_cursor = (ui.menu_cursor + 1) % kMenuItems;
     } else if (ch == KEY_LEFT) {
-        if (ui.menu_cursor >= 11 && ui.menu_cursor <= 13) ui.menu_cursor--;
-        else if (ui.menu_cursor == 15) ui.menu_cursor = 14;
+        if (ui.menu_cursor >= 12 && ui.menu_cursor <= 14) ui.menu_cursor--;
+        else if (ui.menu_cursor == 16) ui.menu_cursor = 15;
     } else if (ch == KEY_RIGHT) {
-        if (ui.menu_cursor >= 10 && ui.menu_cursor <= 12) ui.menu_cursor++;
-        else if (ui.menu_cursor == 14) ui.menu_cursor = 15;
+        if (ui.menu_cursor >= 11 && ui.menu_cursor <= 13) ui.menu_cursor++;
+        else if (ui.menu_cursor == 15) ui.menu_cursor = 16;
     } else if (ch == ' ' || ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         if (ui.menu_cursor == 0) ui.menu_cpu = !ui.menu_cpu;
         else if (ui.menu_cursor == 1) ui.menu_gpu = !ui.menu_gpu;
         else if (ui.menu_cursor == 2) ui.menu_npu = !ui.menu_npu;
         else if (ui.menu_cursor == 3) ui.menu_rga = !ui.menu_rga;
         else if (ui.menu_cursor == 4) ui.menu_mpp = !ui.menu_mpp;
-        else if (ui.menu_cursor == 5) ui.menu_emc = !ui.menu_emc;
-        else if (ui.menu_cursor == 6) ui.menu_rs232 = !ui.menu_rs232;
-        else if (ui.menu_cursor == 7) ui.menu_rs485 = !ui.menu_rs485;
-        else if (ui.menu_cursor == 8) ui.menu_usb = !ui.menu_usb;
-        else if (ui.menu_cursor == 9) ui.menu_can = !ui.menu_can;
-        else if (ui.menu_cursor >= 10 && ui.menu_cursor <= 13) ui.menu_ports[ui.menu_cursor - 10] = !ui.menu_ports[ui.menu_cursor - 10];
-        else if (ui.menu_cursor == 14) ui.apply_menu(engine);
-        else if (ui.menu_cursor == 15) {
+        else if (ui.menu_cursor == 5) ui.menu_ddr = !ui.menu_ddr;
+        else if (ui.menu_cursor == 6) ui.menu_emc = !ui.menu_emc;
+        else if (ui.menu_cursor == 7) ui.menu_rs232 = !ui.menu_rs232;
+        else if (ui.menu_cursor == 8) ui.menu_rs485 = !ui.menu_rs485;
+        else if (ui.menu_cursor == 9) ui.menu_usb = !ui.menu_usb;
+        else if (ui.menu_cursor == 10) ui.menu_can = !ui.menu_can;
+        else if (ui.menu_cursor >= 11 && ui.menu_cursor <= 14) ui.menu_ports[ui.menu_cursor - 11] = !ui.menu_ports[ui.menu_cursor - 11];
+        else if (ui.menu_cursor == 15) ui.apply_menu(engine);
+        else if (ui.menu_cursor == 16) {
             ui.menu_open = false;
             ui.prompt_status = "Menu closed. No changes applied.";
         }
@@ -422,19 +487,31 @@ bool handle_menu_input(int ch, RkTesterEngine& engine, UiState& ui) {
         ui.menu_rga = !ui.menu_rga; ui.menu_cursor = 3;
     } else if (ch == 'v' || ch == 'V') {
         ui.menu_mpp = !ui.menu_mpp; ui.menu_cursor = 4;
+    } else if (ch == 'b' || ch == 'B') {
+        ui.menu_ddr = !ui.menu_ddr; ui.menu_cursor = 5;
     } else if (ch == '4') {
-        bool all_on = ui.menu_cpu && ui.menu_gpu && ui.menu_npu && ui.menu_rga && ui.menu_mpp;
-        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = !all_on;
+        bool all_on = ui.menu_cpu && ui.menu_gpu && ui.menu_npu && ui.menu_rga && ui.menu_mpp && ui.menu_ddr;
+        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = ui.menu_ddr = !all_on;
     } else if (ch == '5') {
-        ui.menu_emc = !ui.menu_emc; ui.menu_cursor = 5;
+        ui.menu_emc = !ui.menu_emc; ui.menu_cursor = 6;
     } else if (ch == '6') {
-        ui.menu_rs232 = !ui.menu_rs232; ui.menu_cursor = 6;
+        ui.menu_rs232 = !ui.menu_rs232; ui.menu_cursor = 7;
     } else if (ch == '7') {
-        ui.menu_rs485 = !ui.menu_rs485; ui.menu_cursor = 7;
+        ui.menu_rs485 = !ui.menu_rs485; ui.menu_cursor = 8;
     } else if (ch == '8') {
-        ui.menu_usb = !ui.menu_usb; ui.menu_cursor = 8;
+        ui.menu_usb = !ui.menu_usb; ui.menu_cursor = 9;
     } else if (ch == '9') {
-        ui.menu_can = !ui.menu_can; ui.menu_cursor = 9;
+        ui.menu_can = !ui.menu_can; ui.menu_cursor = 10;
+    } else if (ch == 't' || ch == 'T') {
+        engine.net_emc.toggle_high_load();
+        ui.prompt_status = engine.net_emc.high_load.load()
+                               ? "4-LAN mode: High-Load 1480B Gigabit Burst (paired ports only)."
+                               : "4-LAN mode: Standard 100ms EMC Monitor.";
+    } else if (ch == 'f' || ch == 'F') {
+        engine.can_tester.toggle_fd_mode();
+        ui.prompt_status = engine.can_tester.fd_mode.load()
+                               ? "CAN mode: CAN-FD 64B 2Mbps high-rate (500fps)."
+                               : "CAN mode: Standard CAN 2.0 8B 500kbps (50fps).";
     } else if (ch == 'z' || ch == 'Z') {
         engine.rs232.cycle_direction();
         ui.prompt_status = "RS232 mode switched: " + engine.rs232.get_mode_name();
@@ -442,10 +519,10 @@ bool handle_menu_input(int ch, RkTesterEngine& engine, UiState& ui) {
         engine.rs485.cycle_direction();
         ui.prompt_status = "RS485 mode switched: " + engine.rs485.get_mode_name();
     } else if (ch == 'd' || ch == 'D') {
-        if (ui.menu_cursor == 6) {
+        if (ui.menu_cursor == 7) {
             engine.rs232.cycle_direction();
             ui.prompt_status = "RS232 mode switched: " + engine.rs232.get_mode_name();
-        } else if (ui.menu_cursor == 7) {
+        } else if (ui.menu_cursor == 8) {
             engine.rs485.cycle_direction();
             ui.prompt_status = "RS485 mode switched: " + engine.rs485.get_mode_name();
         } else {
@@ -453,11 +530,11 @@ bool handle_menu_input(int ch, RkTesterEngine& engine, UiState& ui) {
             ui.prompt_status = "CAN mode switched: " + engine.can_tester.get_mode_name();
         }
     } else if (ch == 'a' || ch == 'A') {
-        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = true;
+        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = ui.menu_ddr = true;
         ui.menu_emc = ui.menu_rs232 = ui.menu_rs485 = ui.menu_usb = ui.menu_can = true;
         ui.menu_ports[0] = ui.menu_ports[1] = ui.menu_ports[2] = ui.menu_ports[3] = true;
     } else if (ch == 'n' || ch == 'N') {
-        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = false;
+        ui.menu_cpu = ui.menu_gpu = ui.menu_npu = ui.menu_rga = ui.menu_mpp = ui.menu_ddr = false;
         ui.menu_emc = ui.menu_rs232 = ui.menu_rs485 = ui.menu_usb = ui.menu_can = false;
     } else if (ch == 's' || ch == 'S') {
         ui.apply_menu(engine);
@@ -489,6 +566,9 @@ bool handle_dashboard_input(int ch, RkTesterEngine& engine, UiState& ui) {
     } else if (ch == 'v' || ch == 'V') {
         ui.prompt_status = engine.toggle_mpp_stress();
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
+    } else if (ch == 'b' || ch == 'B') {
+        ui.prompt_status = engine.toggle_ddr_stress();
+        if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == '4' || ch == 'a' || ch == 'A') {
         ui.prompt_status = engine.toggle_all_stress();
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
@@ -496,12 +576,26 @@ bool handle_dashboard_input(int ch, RkTesterEngine& engine, UiState& ui) {
         bool next = !engine.net_emc.active.load();
         engine.net_emc.active.store(next);
         if (next) {
-            ui.prompt_status = "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3).";
-            engine.log_emc_event("INFO", "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3)", 1);
+            if (engine.net_emc.high_load.load()) {
+                ui.prompt_status = "4-LAN High-Load 1480B Gigabit Burst STARTED (paired ports only).";
+                engine.log_emc_event("INFO", "4-LAN High-Load 1480B Gigabit Burst STARTED", 1);
+            } else {
+                ui.prompt_status = "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3).";
+                engine.log_emc_event("INFO", "4-LAN Dual-Pair Mutual Ping STARTED (lan0<->lan1, lan2<->lan3)", 1);
+            }
         } else {
             ui.prompt_status = "4-LAN ping monitoring PAUSED.";
             engine.log_emc_event("INFO", "4-LAN ping monitoring PAUSED.", 2);
         }
+        if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
+    } else if (ch == 't' || ch == 'T') {
+        engine.net_emc.toggle_high_load();
+        bool hl = engine.net_emc.high_load.load();
+        ui.prompt_status = hl
+                               ? "4-LAN switched to HIGH-LOAD 1480B Gigabit Burst (paired ports only)."
+                               : "4-LAN switched to standard 100ms EMC Monitor.";
+        engine.log_emc_event("INFO", hl ? "Switched 4-LAN to HIGH-LOAD 1480B Burst"
+                                        : "Switched 4-LAN to 100ms EMC Monitor", 1);
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == '6') {
         engine.toggle_rs232();
@@ -517,13 +611,20 @@ bool handle_dashboard_input(int ch, RkTesterEngine& engine, UiState& ui) {
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == '8' || ch == 'u' || ch == 'U') {
         engine.toggle_usb_stress();
-        ui.prompt_status = engine.usb_tester.active.load() ? "4-Port USB storage R/W stress STARTED." : "USB storage stress STOPPED.";
+        ui.prompt_status = engine.usb_tester.active.load() ? "4-Port USB storage 4MB O_DIRECT stress STARTED." : "USB storage stress STOPPED.";
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == '9') {
         engine.toggle_can();
         ui.prompt_status = engine.can_tester.active.load()
-                               ? ("CAN (" + engine.can_tester.get_mode_name() + ") STARTED.")
+                               ? (std::string(engine.can_tester.fd_mode.load() ? "CAN-FD 64B (" : "CAN (") +
+                                  engine.can_tester.get_mode_name() + ") STARTED.")
                                : "CAN test STOPPED.";
+        if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
+    } else if (ch == 'f' || ch == 'F') {
+        engine.can_tester.toggle_fd_mode();
+        ui.prompt_status = engine.can_tester.fd_mode.load()
+                               ? "CAN switched to CAN-FD 64B @ 2Mbps (500fps high-rate stress)."
+                               : "CAN switched to Standard CAN 2.0 8B @ 500kbps (50fps).";
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == 'z' || ch == 'Z') {
         engine.rs232.cycle_direction();
@@ -548,14 +649,14 @@ bool handle_dashboard_input(int ch, RkTesterEngine& engine, UiState& ui) {
         if (!ui.config_path.empty()) save_engine_config(engine, ui.config_path);
     } else if (ch == 'r' || ch == 'R') {
         engine.reset_all_stats();
-        ui.prompt_status = "All statistics (LAN, Serial, CAN, USB) reset to zero.";
+        ui.prompt_status = "All statistics (DDR, LAN, Serial, CAN, USB) reset to zero.";
     }
     return false;
 }
 
 void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     const int box_w = 72;
-    const int box_h = 20;
+    const int box_h = 21;
     int my = std::max(1, (h - box_h) / 2);
     int mx = std::max(2, (w - box_w) / 2);
 
@@ -566,7 +667,7 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     attroff(COLOR_PAIR(4) | A_BOLD);
 
     attron(COLOR_PAIR(7));
-    mvprintw(my + 3, mx, "| [Up/Down][Space] toggle, [0..9,V] quick, [Z]232 [X]485 [D]CAN Dir:   |");
+    mvprintw(my + 3, mx, "| [Up/Down][Space] toggle, [0-9,V,B] item, [T]Burst [F]FD [Z/X/D] Dir: |");
     mvprintw(my + 4, mx, "|                                                                      |");
     attroff(COLOR_PAIR(7));
 
@@ -577,20 +678,22 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
         bool checked;
     };
 
-    MenuItem items[10] = {
+    std::string lan_desc = engine.net_emc.high_load.load() ? "BURST 1480B Gigabit [T]" : "EMC 100ms Mutual [T]";
+    MenuItem items[11] = {
         {"[1]", "CPU 8-Core Compute Stress", "8-Core NEON+DDR burn-in", ui.menu_cpu},
         {"[2]", "Mali-G52 GPU EGL/GLES", "Panfrost FBO shader burn", ui.menu_gpu},
         {"[3]", "RK-NPU Dual-Core AI Stress", "Dual-Core 6 TOPS MatMul", ui.menu_npu},
         {"[0]", "RK-RGA Dual-Core 2D Stress", "Dual-RGA2 4K CSC+Rotate", ui.menu_rga},
         {"[V]", "RK-MPP 4K Video Stress", "Dual-4K H.265 VENC+VDEC", ui.menu_mpp},
-        {"[5]", "4-LAN Dual-Pair Mutual Ping", "lan0<->lan1, lan2<->lan3", ui.menu_emc},
+        {"[B]", "DDR Memory Stress", "Large-RAM NEON bit-flip", ui.menu_ddr},
+        {"[5]", "4-LAN Dual-Pair Ethernet", lan_desc, ui.menu_emc},
         {"[6]", "RS232 (" + engine.rs232.get_short_mode_name() + ")", engine.rs232.get_menu_desc(), ui.menu_rs232},
         {"[7]", "RS485 (" + engine.rs485.get_short_mode_name() + ")", engine.rs485.get_menu_desc(), ui.menu_rs485},
-        {"[8]", "4-Port USB Storage Stress", "sda..sdd R/W & verify", ui.menu_usb},
+        {"[8]", "4-Port USB Storage Stress", "sda..sdd 4MB O_DIRECT", ui.menu_usb},
         {"[9]", "CAN Bus (" + engine.can_tester.get_short_mode_name() + ")", engine.can_tester.get_menu_desc(), ui.menu_can}
     };
 
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 11; ++i) {
         int cur_y = my + 5 + i;
         attron(COLOR_PAIR(4) | A_BOLD);
         mvprintw(cur_y, mx, "|");
@@ -631,7 +734,7 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
         attroff(COLOR_PAIR(8));
     }
 
-    int py = my + 15;
+    int py = my + 16;
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(py, mx, "|");
     mvprintw(py, mx + box_w - 1, "|");
@@ -644,7 +747,7 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     const char* p_names[4] = {"lan0", "lan1", "lan2", "lan3"};
     int px = mx + 36;
     for (int i = 0; i < 4; ++i) {
-        bool is_sel = (ui.menu_cursor == 10 + i);
+        bool is_sel = (ui.menu_cursor == 11 + i);
         if (is_sel) {
             attron(COLOR_PAIR(2) | A_BOLD);
             mvprintw(py, px - 1, ">");
@@ -662,23 +765,23 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
         px += 8;
     }
 
-    int ay = my + 16;
+    int ay = my + 17;
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(ay, mx, "|");
     mvprintw(ay, mx + box_w - 1, "|");
     attroff(COLOR_PAIR(4) | A_BOLD);
 
-    int apply_attr = (ui.menu_cursor == 14) ? (COLOR_PAIR(1) | A_REVERSE | A_BOLD) : (COLOR_PAIR(1) | A_BOLD);
+    int apply_attr = (ui.menu_cursor == 15) ? (COLOR_PAIR(1) | A_REVERSE | A_BOLD) : (COLOR_PAIR(1) | A_BOLD);
     attron(apply_attr);
     mvprintw(ay, mx + 5, "[ S / ENTER: Apply & Run Selected Tests ]");
     attroff(apply_attr);
 
-    int cancel_attr = (ui.menu_cursor == 15) ? (COLOR_PAIR(3) | A_REVERSE | A_BOLD) : COLOR_PAIR(7);
+    int cancel_attr = (ui.menu_cursor == 16) ? (COLOR_PAIR(3) | A_REVERSE | A_BOLD) : COLOR_PAIR(7);
     attron(cancel_attr);
     mvprintw(ay, mx + 49, "[ ESC: Cancel ]");
     attroff(cancel_attr);
 
-    int hy = my + 17;
+    int hy = my + 18;
     attron(COLOR_PAIR(4) | A_BOLD);
     mvprintw(hy, mx, "|");
     mvprintw(hy, mx + box_w - 1, "|");
@@ -694,11 +797,11 @@ void draw_menu(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
     attron(COLOR_PAIR(7)); mvprintw(hy, mx + 57, "Dashboard"); attroff(COLOR_PAIR(7));
 
     attron(COLOR_PAIR(4) | A_BOLD);
-    mvprintw(my + 18, mx, "+----------------------------------------------------------------------+");
+    mvprintw(my + 19, mx, "+----------------------------------------------------------------------+");
     attroff(COLOR_PAIR(4) | A_BOLD);
 
     attron(COLOR_PAIR(7) | A_BOLD);
-    mvprintw(my + 19, mx, "Status: %-62.62s", ui.prompt_status.c_str());
+    mvprintw(my + 20, mx, "Status: %-62.62s", ui.prompt_status.c_str());
     attroff(COLOR_PAIR(7) | A_BOLD);
 }
 
@@ -729,9 +832,9 @@ std::string format_compact_bytes(uint64_t b) {
 }
 
 void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int w) {
-    // Top title
+    // Top title (高对比度亮青粗体 + 默认背景，避免灰字贴白底发糊)
     attron(COLOR_PAIR(14) | A_BOLD);
-    mvprintw(0, 2, " RK3576 INDUSTRIAL HARDWARE TEST PLATFORM ");
+    mvprintw(0, 2, "RK3576 INDUSTRIAL HARDWARE TEST PLATFORM");
     attroff(COLOR_PAIR(14) | A_BOLD);
 
     char meta[128];
@@ -759,13 +862,30 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
     // ========================================================================
     // SECTION 1: COMPUTE & SOC ACCELERATORS
     // ========================================================================
-    draw_section_banner(line++, w, 9, 4, "[1-4,0,V] COMPUTE & SOC ACCELERATORS", "CPU/GPU/NPU/RGA/MPP/Temp");
+    draw_section_banner(line++, w, 9, 4, "[1-4,0,V,B] COMPUTE & SOC/DDR", "CPU/GPU/NPU/RGA/MPP/DDR/Temp");
+
+    bool ddr_on = engine.ddr_tester.active.load();
+    uint64_t ddr_alloc_mb = engine.ddr_tester.get_alloc_mb();
+    uint64_t ddr_bytes = engine.ddr_tester.get_bytes_tested();
+    uint64_t ddr_passes = engine.ddr_tester.get_passes();
+    uint64_t ddr_errs = engine.ddr_tester.get_bit_errors();
+    double ddr_bw = engine.ddr_tester.get_bw_gb_s();
+    double ddr_gb = static_cast<double>(ddr_bytes) / (1024.0 * 1024.0 * 1024.0);
 
     if (spacious) {
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "CPU Stress:"); attroff(COLOR_PAIR(7) | A_BOLD);
         int cpu_col = engine.cpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
+        int burn_n = engine.get_active_cpu_burn_cores();
+        char cpu_tag[32];
+        if (!engine.cpu_stress.load()) {
+            snprintf(cpu_tag, sizeof(cpu_tag), "[IDLE]");
+        } else if (engine.keep_isolcpus && burn_n < engine.num_cores) {
+            snprintf(cpu_tag, sizeof(cpu_tag), "[STRESS ON: %dC RT]", burn_n);
+        } else {
+            snprintf(cpu_tag, sizeof(cpu_tag), "[STRESS ON: %d-CORES]", burn_n);
+        }
         attron(cpu_col);
-        mvprintw(line, 16, "%s", engine.cpu_stress.load() ? "[STRESS ON: 8-CORES]" : "[IDLE]");
+        mvprintw(line, 16, "%s", cpu_tag);
         attroff(cpu_col);
 
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 39, "Total Load: "); attroff(COLOR_PAIR(7) | A_BOLD);
@@ -779,14 +899,16 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
             double p_a53 = (i < static_cast<int>(ui.core_cpus.size())) ? ui.core_cpus[i] : 0.0;
             attron(COLOR_PAIR(7)); mvprintw(line + i, 3, "A53 Core C%d:", i); attroff(COLOR_PAIR(7));
             draw_bar(line + i, 15, bar_w, p_a53, get_color_by_load(p_a53));
-            attron(COLOR_PAIR(6)); mvprintw(line + i, 15 + bar_w + 1, "%4dM", f_a53); attroff(COLOR_PAIR(6));
+            int f_a53_col = ui.throttle.cpu_little ? (COLOR_PAIR(2) | A_BOLD) : COLOR_PAIR(6);
+            attron(f_a53_col); mvprintw(line + i, 15 + bar_w + 1, "%4dM", f_a53); attroff(f_a53_col);
 
             int bi = i + 4;
             int f_a72 = (bi < static_cast<int>(ui.cpu_freqs.size())) ? ui.cpu_freqs[bi] : 0;
             double p_a72 = (bi < static_cast<int>(ui.core_cpus.size())) ? ui.core_cpus[bi] : 0.0;
             attron(COLOR_PAIR(7)); mvprintw(line + i, half_w + 2, "A72 Core C%d:", bi); attroff(COLOR_PAIR(7));
             draw_bar(line + i, half_w + 14, bar_w, p_a72, get_color_by_load(p_a72));
-            attron(COLOR_PAIR(6)); mvprintw(line + i, half_w + 14 + bar_w + 1, "%4dM", f_a72); attroff(COLOR_PAIR(6));
+            int f_a72_col = ui.throttle.cpu_big ? (COLOR_PAIR(2) | A_BOLD) : COLOR_PAIR(6);
+            attron(f_a72_col); mvprintw(line + i, half_w + 14 + bar_w + 1, "%4dM", f_a72); attroff(f_a72_col);
         }
         line += 4;
 
@@ -794,13 +916,21 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         int gpu_col = engine.gpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
         attron(gpu_col); mvprintw(line, 13, "%s", engine.gpu_stress.load() ? "[RUN]" : "[IDLE]"); attroff(gpu_col);
         draw_bar(line, 20, 14, ui.gpu_load, get_color_by_load(ui.gpu_load));
-        attron(COLOR_PAIR(6)); mvprintw(line, 35, "%4dM", ui.gpu_freq); attroff(COLOR_PAIR(6));
+        int gf_col = ui.throttle.gpu ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(6);
+        attron(gf_col);
+        if (ui.throttle.gpu) mvprintw(line, 35, "%3dM!", ui.gpu_freq);
+        else mvprintw(line, 35, "%4dM", ui.gpu_freq);
+        attroff(gf_col);
 
         attron(COLOR_PAIR(7)); mvprintw(line, 41, "| NPU:"); attroff(COLOR_PAIR(7));
         int npu_col = engine.npu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
         attron(npu_col); mvprintw(line, 48, "%s", engine.npu_stress.load() ? "[RUN]" : "[IDLE]"); attroff(npu_col);
         attron(COLOR_PAIR(7)); mvprintw(line, 55, "C0:%3.0f%% C1:%3.0f%%", ui.npu_loads[0], ui.npu_loads[1]); attroff(COLOR_PAIR(7));
-        attron(COLOR_PAIR(6)); mvprintw(line, 71, "%4dM", ui.npu_freq); attroff(COLOR_PAIR(6));
+        int nf_col = ui.throttle.npu ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(6);
+        attron(nf_col);
+        if (ui.throttle.npu) mvprintw(line, 71, "%3dM!", ui.npu_freq);
+        else mvprintw(line, 71, "%4dM", ui.npu_freq);
+        attroff(nf_col);
         line++;
 
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "RGA2 2D:"); attroff(COLOR_PAIR(7) | A_BOLD);
@@ -816,11 +946,48 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         attron(COLOR_PAIR(6)); mvprintw(line, 71, "%4dM", ui.mpp_freq); attroff(COLOR_PAIR(6));
         line++;
 
-        attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "RAM Load:"); attroff(COLOR_PAIR(7) | A_BOLD);
-        attron(COLOR_PAIR(7)); mvprintw(line, 13, "%3.1fG/%3.1fG", ui.used_ram, ui.tot_ram); attroff(COLOR_PAIR(7));
-        draw_bar(line, 24, 12, ui.ram_pct, get_color_by_load(ui.ram_pct));
+        if (extra_spacious) {
+            attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "DDR Mem:"); attroff(COLOR_PAIR(7) | A_BOLD);
+            int ddr_col = ddr_on ? ((ddr_errs == 0) ? (COLOR_PAIR(3) | A_BOLD) : (COLOR_PAIR(3) | A_REVERSE | A_BOLD))
+                                 : COLOR_PAIR(1);
+            attron(ddr_col); mvprintw(line, 13, "%s", ddr_on ? "[RUN]" : "[IDLE]"); attroff(ddr_col);
+            if (ddr_on || ddr_bytes > 0) {
+                attron(COLOR_PAIR(6) | A_BOLD);
+                mvprintw(line, 20, "%4lluMB  BW:%4.2fGB/s", static_cast<unsigned long long>(ddr_alloc_mb), ddr_bw);
+                attroff(COLOR_PAIR(6) | A_BOLD);
+                attron(COLOR_PAIR(7));
+                mvprintw(line, 41, "| Tested:%5.1fG Pass:%-3llu", ddr_gb, static_cast<unsigned long long>(ddr_passes));
+                attroff(COLOR_PAIR(7));
+                int derr_col = (ddr_errs == 0) ? (COLOR_PAIR(1) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD);
+                attron(derr_col);
+                mvprintw(line, 66, "Err:%s", format_compact_count(ddr_errs).c_str());
+                attroff(derr_col);
+            } else {
+                attron(COLOR_PAIR(8));
+                mvprintw(line, 20, "Press [B] for large-RAM NEON bandwidth & bit-flip verify");
+                attroff(COLOR_PAIR(8));
+            }
+            line++;
+        }
+
+        if (!extra_spacious && ddr_on) {
+            attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "RAM/DDR:"); attroff(COLOR_PAIR(7) | A_BOLD);
+            attron(COLOR_PAIR(7)); mvprintw(line, 12, "%3.1f/%3.1fG", ui.used_ram, ui.tot_ram); attroff(COLOR_PAIR(7));
+            int dcol = (ddr_errs == 0) ? (COLOR_PAIR(6) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD);
+            attron(dcol);
+            mvprintw(line, 21, "%4lluM %4.1fG/s %sE",
+                     static_cast<unsigned long long>(ddr_alloc_mb), ddr_bw,
+                     format_compact_count(ddr_errs).c_str());
+            attroff(dcol);
+        } else {
+            attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "RAM Load:"); attroff(COLOR_PAIR(7) | A_BOLD);
+            attron(COLOR_PAIR(7)); mvprintw(line, 13, "%3.1fG/%3.1fG", ui.used_ram, ui.tot_ram); attroff(COLOR_PAIR(7));
+            draw_bar(line, 24, 12, ui.ram_pct, get_color_by_load(ui.ram_pct));
+        }
         attron(COLOR_PAIR(5) | A_BOLD);
-        mvprintw(line, 40, "| Temp: SoC:%.0fC Big:%.0fC GPU:%.0fC NPU:%.0fC", t_soc, t_big, t_gpu, t_npu);
+        mvprintw(line, 40, "| Temp: SoC:%.0fC Big:%.0fC GPU:%.0fC NPU:%.0fC%s",
+                 t_soc, t_big, t_gpu, t_npu,
+                 (ui.throttle.any() && w >= 88) ? " [THR]" : "");
         attroff(COLOR_PAIR(5) | A_BOLD);
         line++;
     } else {
@@ -828,7 +995,14 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         int cpu_col = engine.cpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
         attron(cpu_col); mvprintw(line, 8, "%s", engine.cpu_stress.load() ? "[STRESS ON]" : "[IDLE]"); attroff(cpu_col);
         draw_bar(line, 20, 12, ui.total_cpu, get_color_by_load(ui.total_cpu));
-        attron(COLOR_PAIR(7)); mvprintw(line, 33, "| RAM:%3.1fG/%3.1fG", ui.used_ram, ui.tot_ram); attroff(COLOR_PAIR(7));
+        if (ddr_on) {
+            int dcol = (ddr_errs == 0) ? (COLOR_PAIR(6) | A_BOLD) : (COLOR_PAIR(3) | A_BOLD);
+            attron(dcol);
+            mvprintw(line, 33, "| DDR:%4.1fG/s %sE", ddr_bw, format_compact_count(ddr_errs).c_str());
+            attroff(dcol);
+        } else {
+            attron(COLOR_PAIR(7)); mvprintw(line, 33, "| RAM:%3.1fG/%3.1fG", ui.used_ram, ui.tot_ram); attroff(COLOR_PAIR(7));
+        }
         attron(COLOR_PAIR(5) | A_BOLD);
         mvprintw(line, 52, "| Temp:SoC:%.0fC Big:%.0fC", t_soc, t_big);
         attroff(COLOR_PAIR(5) | A_BOLD);
@@ -855,13 +1029,21 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         int gpu_col = engine.gpu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
         attron(gpu_col); mvprintw(line, 8, "%s", engine.gpu_stress.load() ? "[RUN]" : "[IDLE]"); attroff(gpu_col);
         draw_bar(line, 15, 12, ui.gpu_load, get_color_by_load(ui.gpu_load));
-        attron(COLOR_PAIR(6)); mvprintw(line, 28, "%4dM", ui.gpu_freq); attroff(COLOR_PAIR(6));
+        int gf_col = ui.throttle.gpu ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(6);
+        attron(gf_col);
+        if (ui.throttle.gpu) mvprintw(line, 28, "%3dM!", ui.gpu_freq);
+        else mvprintw(line, 28, "%4dM", ui.gpu_freq);
+        attroff(gf_col);
 
         attron(COLOR_PAIR(7)); mvprintw(line, 34, "| NPU:"); attroff(COLOR_PAIR(7));
         int npu_col = engine.npu_stress.load() ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(1);
         attron(npu_col); mvprintw(line, 41, "%s", engine.npu_stress.load() ? "[RUN]" : "[IDLE]"); attroff(npu_col);
         attron(COLOR_PAIR(7)); mvprintw(line, 48, "C0:%2.0f%% C1:%2.0f%%", ui.npu_loads[0], ui.npu_loads[1]); attroff(COLOR_PAIR(7));
-        attron(COLOR_PAIR(6)); mvprintw(line, 62, "%4dM", ui.npu_freq); attroff(COLOR_PAIR(6));
+        int nf_col = ui.throttle.npu ? (COLOR_PAIR(3) | A_BOLD) : COLOR_PAIR(6);
+        attron(nf_col);
+        if (ui.throttle.npu) mvprintw(line, 62, "%3dM!", ui.npu_freq);
+        else mvprintw(line, 62, "%4dM", ui.npu_freq);
+        attroff(nf_col);
         attron(COLOR_PAIR(5) | A_BOLD); mvprintw(line, 68, "G:%.0fC", t_gpu); attroff(COLOR_PAIR(5) | A_BOLD);
         line++;
 
@@ -886,7 +1068,8 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
     // SECTION 2: 4-PORT GIGABIT ETHERNET & PING MONITOR
     // ========================================================================
     EmcSnapshot emc = engine.get_emc_snapshot();
-    draw_section_banner(line++, w, 10, 1, "[5] 4-PORT GIGABIT ETHERNET", "lan0<->lan1 & lan2<->lan3 Mutual Ping");
+    draw_section_banner(line++, w, 10, 1, "[5/T] 4-PORT GIGABIT ETHERNET",
+                        emc.high_load ? "BURST 1480B Gigabit Stress [T]" : "lan0<->lan1 & lan2<->lan3 EMC [T]");
 
     for (size_t i = 0; i < emc.ports.size() && i < 4; ++i) {
         const auto& port = emc.ports[i];
@@ -911,26 +1094,52 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
             if (d1 != std::string::npos) ip_suffix = ip_suffix.substr(d1);
         }
 
+        std::string s_sent = format_compact_count(port.sent);
+        std::string s_recv = format_compact_count(port.recv);
+        std::string s_lost = format_compact_count(port.lost);
+
         attron(COLOR_PAIR(7));
-        mvprintw(row, 36, "%-6s|S:%-4llu R:%-4llu L:",
-                 ip_suffix.c_str(),
-                 static_cast<unsigned long long>(port.sent),
-                 static_cast<unsigned long long>(port.recv));
+        mvprintw(row, 36, "%-6s|S:%-5s R:%-5s L:",
+                 ip_suffix.c_str(), s_sent.c_str(), s_recv.c_str());
         attroff(COLOR_PAIR(7));
 
         int p_lost_col = (port.lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
         double p_loss_pct = (port.sent > 0) ? (port.lost * 100.0 / port.sent) : 0.0;
         attron(p_lost_col);
-        mvprintw(row, 57, "%-3llu", static_cast<unsigned long long>(port.lost));
+        mvprintw(row, 59, "%-4s", s_lost.c_str());
         attroff(p_lost_col);
 
         attron(COLOR_PAIR(7));
-        if (port.sent > 0) mvprintw(row, 61, "(%4.1f%%)", p_loss_pct);
-        else mvprintw(row, 61, "( --- )");
+        if (port.sent > 0) mvprintw(row, 63, "(%4.1f%%)", p_loss_pct);
+        else mvprintw(row, 63, "( --- )");
 
-        if (port.recv > 0) mvprintw(row, 69, "%4.2fms", port.rtt_cur);
-        else mvprintw(row, 69, " --.-ms");
-        attroff(COLOR_PAIR(7));
+        bool show_mbps = emc.high_load && port.carrier && (port.tx_mbps > 0.05 || port.rx_mbps > 0.05);
+        if (show_mbps && w < 94) {
+            attroff(COLOR_PAIR(7));
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(row, 71, "%4.0fMb", port.tx_mbps + port.rx_mbps);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+        } else {
+            if (port.recv > 0) mvprintw(row, 71, "%4.2fms", port.rtt_cur);
+            else mvprintw(row, 71, " --.-ms");
+            attroff(COLOR_PAIR(7));
+        }
+
+        uint64_t hw_e = port.hw_rx_err + port.hw_tx_err + port.hw_rx_drop;
+        if (show_mbps && w >= 94) {
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(row, 79, "%3.0f/%3.0fMb", port.tx_mbps, port.rx_mbps);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+            if (hw_e > 0 && w >= 100) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+                mvprintw(row, 90, "HW:%s", format_compact_count(hw_e).c_str());
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            }
+        } else if (hw_e > 0 && w >= 88) {
+            attron(COLOR_PAIR(3) | A_BOLD);
+            mvprintw(row, 79, "HW:%s", format_compact_count(hw_e).c_str());
+            attroff(COLOR_PAIR(3) | A_BOLD);
+        }
     }
     line += 4;
 
@@ -955,25 +1164,37 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         }
     }
 
-    const char* emc_st = engine.net_emc.active.load() ? "[RUN 100ms]" : "[STANDBY]";
-    int emc_col = engine.net_emc.active.load() ? (COLOR_PAIR(1) | A_BOLD) : COLOR_PAIR(2);
+    const char* emc_st = engine.net_emc.active.load()
+                             ? (emc.high_load ? "[BURST 1480B]" : "[RUN 100ms]")
+                             : (emc.high_load ? "[STBY BURST]" : "[STANDBY]");
+    int emc_col = engine.net_emc.active.load()
+                      ? (emc.high_load ? (COLOR_PAIR(6) | A_BOLD) : (COLOR_PAIR(1) | A_BOLD))
+                      : COLOR_PAIR(2);
+
+    std::string tot_s = format_compact_count(emc.total_sent);
+    std::string tot_r = format_compact_count(emc.total_recv);
+    std::string tot_l = format_compact_count(emc.total_lost);
 
     if (spacious) {
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "Mutual Ping:"); attroff(COLOR_PAIR(7) | A_BOLD);
-        attron(emc_col); mvprintw(line, 16, "%s", emc_st); attroff(emc_col);
-        attron(rate_col); mvprintw(line, 29, "[%s]", rating.c_str()); attroff(rate_col);
-        attron(COLOR_PAIR(7)); mvprintw(line, 47, "Pairs: lan0<->lan1 | lan2<->lan3"); attroff(COLOR_PAIR(7));
+        attron(emc_col); mvprintw(line, 16, "%-13s", emc_st); attroff(emc_col);
+        attron(rate_col); mvprintw(line, 30, "[%s]", rating.c_str()); attroff(rate_col);
+        if (emc.high_load) {
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(line, 48, "TX:%5.1f RX:%5.1f Mbps", emc.total_tx_mbps, emc.total_rx_mbps);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+        } else {
+            attron(COLOR_PAIR(7)); mvprintw(line, 48, "Pairs: lan0<->lan1 | lan2<->lan3"); attroff(COLOR_PAIR(7));
+        }
         line++;
 
         attron(COLOR_PAIR(7));
-        mvprintw(line, 3, "Ping Stats:  Sent:%-5llu Recv:%-5llu Lost:",
-                 static_cast<unsigned long long>(emc.total_sent),
-                 static_cast<unsigned long long>(emc.total_recv));
+        mvprintw(line, 3, "Ping Stats:  Sent:%-6s Recv:%-6s Lost:", tot_s.c_str(), tot_r.c_str());
         attroff(COLOR_PAIR(7));
         int lost_col = (emc.total_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
-        attron(lost_col); mvprintw(line, 44, "%-4llu", static_cast<unsigned long long>(emc.total_lost)); attroff(lost_col);
+        attron(lost_col); mvprintw(line, 45, "%-5s", tot_l.c_str()); attroff(lost_col);
         attron(COLOR_PAIR(7));
-        mvprintw(line, 49, "(%4.1f%%) | Link Flaps:%-2llu", tot_loss_pct, static_cast<unsigned long long>(emc.total_flaps));
+        mvprintw(line, 51, "(%4.1f%%) | Link Flaps:%-2llu", tot_loss_pct, static_cast<unsigned long long>(emc.total_flaps));
         attroff(COLOR_PAIR(7));
         line++;
 
@@ -985,14 +1206,24 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
         line++;
     } else {
         attron(COLOR_PAIR(7) | A_BOLD); mvprintw(line, 3, "Ping:"); attroff(COLOR_PAIR(7) | A_BOLD);
-        attron(emc_col); mvprintw(line, 9, "%s", emc_st); attroff(emc_col);
-        attron(rate_col); mvprintw(line, 21, "[%s]", rating.c_str()); attroff(rate_col);
-        attron(COLOR_PAIR(7));
-        mvprintw(line, 37, "0<->1,2<->3 | S:%-4llu L:", static_cast<unsigned long long>(emc.total_sent));
-        attroff(COLOR_PAIR(7));
-        int lost_col = (emc.total_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
-        attron(lost_col); mvprintw(line, 62, "%-3llu", static_cast<unsigned long long>(emc.total_lost)); attroff(lost_col);
-        attron(COLOR_PAIR(7)); mvprintw(line, 66, "F:%-2llu", static_cast<unsigned long long>(emc.total_flaps)); attroff(COLOR_PAIR(7));
+        attron(emc_col); mvprintw(line, 9, "%-13s", emc_st); attroff(emc_col);
+        attron(rate_col); mvprintw(line, 23, "[%s]", rating.c_str()); attroff(rate_col);
+        if (emc.high_load) {
+            attron(COLOR_PAIR(6) | A_BOLD);
+            mvprintw(line, 40, "TX:%.0f/RX:%.0fMb ", emc.total_tx_mbps, emc.total_rx_mbps);
+            attroff(COLOR_PAIR(6) | A_BOLD);
+            attron(COLOR_PAIR(7)); mvprintw(line, 57, "L:"); attroff(COLOR_PAIR(7));
+            int lost_col = (emc.total_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
+            attron(lost_col); mvprintw(line, 59, "%-4s", tot_l.c_str()); attroff(lost_col);
+            attron(COLOR_PAIR(7)); mvprintw(line, 64, "F:%-2llu", static_cast<unsigned long long>(emc.total_flaps)); attroff(COLOR_PAIR(7));
+        } else {
+            attron(COLOR_PAIR(7));
+            mvprintw(line, 40, "S:%-5s L:", tot_s.c_str());
+            attroff(COLOR_PAIR(7));
+            int lost_col = (emc.total_lost == 0) ? COLOR_PAIR(1) : (COLOR_PAIR(3) | A_BOLD);
+            attron(lost_col); mvprintw(line, 50, "%-4s", tot_l.c_str()); attroff(lost_col);
+            attron(COLOR_PAIR(7)); mvprintw(line, 55, "F:%-2llu", static_cast<unsigned long long>(emc.total_flaps)); attroff(COLOR_PAIR(7));
+        }
         line++;
     }
 
@@ -1001,7 +1232,7 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
     // ========================================================================
     // SECTION 3: INDUSTRIAL FIELDBUS (SERIAL & CAN)
     // ========================================================================
-    draw_section_banner(line++, w, 11, 2, "[6,7,9] INDUSTRIAL FIELDBUS", "Dir: [Z]232 [X]485 [D]CAN");
+    draw_section_banner(line++, w, 11, 2, "[6,7,9/F] INDUSTRIAL FIELDBUS", "Dir:[Z]232 [X]485 [D]CAN | [F]CAN-FD");
 
     auto draw_serial_row = [&](const SerialChannel& sc) {
         std::string short_lbl = sc.get_short_label();
@@ -1117,22 +1348,38 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
 
         if (extra_spacious) {
             const char* mode_tag = (sc.dir.load() == SerialDirection::PING_PONG) ? "PP" : "Uni";
-            char detail[160];
+            uint64_t hw_oe = sc.hw_oe.load();
+            uint64_t hw_fe = sc.hw_fe.load();
+            uint64_t hw_pe = sc.hw_pe.load();
+            bool has_hw_err = (hw_oe > 0 || hw_fe > 0 || hw_pe > 0);
+            char detail[192];
             if (rxf > 0) {
-                snprintf(detail, sizeof(detail),
-                         "- 115200 8N1 64B %s | TX:%s(%.0fF/s) RX:%s(%.0fF/s) CRC:%llu Seq:#%u Max:%.1fms",
-                         mode_tag, s_txb.c_str(), tfps, s_rxb.c_str(), rfps,
-                         static_cast<unsigned long long>(crcs), static_cast<unsigned>(seq), rtt_max);
+                if (has_hw_err) {
+                    snprintf(detail, sizeof(detail),
+                             "- 115200 8N1 64B %s | TX:%s(%.0fF/s) RX:%s(%.0fF/s) HW:oe%llu/fe%llu/pe%llu Max:%.1fms",
+                             mode_tag, s_txb.c_str(), tfps, s_rxb.c_str(), rfps,
+                             static_cast<unsigned long long>(hw_oe),
+                             static_cast<unsigned long long>(hw_fe),
+                             static_cast<unsigned long long>(hw_pe), rtt_max);
+                } else {
+                    snprintf(detail, sizeof(detail),
+                             "- 115200 8N1 64B %s | TX:%s(%.0fF/s) RX:%s(%.0fF/s) CRC:%llu Seq:#%u Max:%.1fms",
+                             mode_tag, s_txb.c_str(), tfps, s_rxb.c_str(), rfps,
+                             static_cast<unsigned long long>(crcs), static_cast<unsigned>(seq), rtt_max);
+                }
             } else {
                 snprintf(detail, sizeof(detail),
-                         "- 115200 8N1 64B | %s | TX:%s(%.0fF/s) RX:%s(%.0fF/s) CRC:%llu",
+                         "- 115200 8N1 64B | %s | TX:%s(%.0fF/s) RX:%s(%.0fF/s) CRC:%llu HW:oe%llu/fe%llu",
                          sc.get_short_mode_name().c_str(),
                          s_txb.c_str(), tfps, s_rxb.c_str(), rfps,
-                         static_cast<unsigned long long>(crcs));
+                         static_cast<unsigned long long>(crcs),
+                         static_cast<unsigned long long>(hw_oe),
+                         static_cast<unsigned long long>(hw_fe));
             }
-            attron(COLOR_PAIR(7));
+            int dcol = has_hw_err ? (COLOR_PAIR(2) | A_BOLD) : COLOR_PAIR(7);
+            attron(dcol);
             mvprintw(line, 5, "%.*s", std::max(10, w - 7), detail);
-            attroff(COLOR_PAIR(7));
+            attroff(dcol);
             line++;
         }
     };
@@ -1256,17 +1503,18 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
                 const char* id_str = (c_dir == CanDirection::CAN0_TO_CAN1) ? "ID:0x121"
                                    : (c_dir == CanDirection::CAN1_TO_CAN0) ? "ID:0x221"
                                                                            : "ID:0x121<>0x221";
+                const char* frame_tag = can.fd_mode.load() ? "FD64B" : "8B";
                 char detail[160];
                 if (c_rx > 0) {
                     snprintf(detail, sizeof(detail),
-                             "- %s 8B %s | TX:%.0fF/s RX:%.0fF/s | CRC:%llu Bus:%llu Seq:#%u Max:%.2fms",
-                             can.get_bitrate_info().c_str(), id_str, c_tx_fps, c_rx_fps,
+                             "- %s %s %s | TX:%.0fF/s RX:%.0fF/s | CRC:%llu Bus:%llu Seq:#%u Max:%.2fms",
+                             can.get_bitrate_info().c_str(), frame_tag, id_str, c_tx_fps, c_rx_fps,
                              static_cast<unsigned long long>(c_crc), static_cast<unsigned long long>(c_bus),
                              static_cast<unsigned>(c_seq), c_rtt_max);
                 } else {
                     snprintf(detail, sizeof(detail),
-                             "- %s 8B %s | %s | TX:%.0fF/s RX:%.0fF/s CRC:%llu Bus:%llu",
-                             can.get_bitrate_info().c_str(), id_str, can.get_short_mode_name().c_str(),
+                             "- %s %s %s | %s | TX:%.0fF/s RX:%.0fF/s CRC:%llu Bus:%llu",
+                             can.get_bitrate_info().c_str(), frame_tag, id_str, can.get_short_mode_name().c_str(),
                              c_tx_fps, c_rx_fps,
                              static_cast<unsigned long long>(c_crc), static_cast<unsigned long long>(c_bus));
                 }
@@ -1283,7 +1531,7 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
     // ========================================================================
     // SECTION 4: 4-PORT HIGH-SPEED USB STORAGE
     // ========================================================================
-    draw_section_banner(line++, w, 12, 6, "[8] 4-PORT USB STORAGE", "sda..sdd Read/Write Stress & Integrity");
+    draw_section_banner(line++, w, 12, 5, "[8] 4-PORT USB STORAGE", "sda..sdd Read/Write Stress & Integrity");
 
     bool usb_on = engine.usb_tester.active.load();
     uint64_t usb_w_mb = engine.usb_tester.get_total_write_mb();
@@ -1406,7 +1654,7 @@ void draw_dashboard(const RkTesterEngine& engine, const UiState& ui, int h, int 
 
     attron(COLOR_PAIR(2) | A_BOLD);
     mvprintw(key_y, 2, "%.*s", max_footer_w,
-             "[Keys] [M]Menu [1-4,0,V]SoC [5]LAN [6/7]Ser [8]USB [9]CAN [Z/X/D]Dir [Q]Quit");
+             "[Keys] [M]Menu [1-4,0,V,B]SoC/DDR [5/T]LAN [6/7]Ser [8]USB [9/F]CAN [Q]Quit");
     attroff(COLOR_PAIR(2) | A_BOLD);
 
     int max_status_w = std::max(10, w - 11);
@@ -1422,7 +1670,7 @@ void init_ncurses_ui() {
     cbreak();
     noecho();
     curs_set(0);
-    nodelay(stdscr, TRUE);
+    timeout(100);
     keypad(stdscr, TRUE);
 
     if (has_colors()) {
@@ -1436,12 +1684,12 @@ void init_ncurses_ui() {
         init_pair(6, COLOR_BLUE, -1);
         init_pair(7, COLOR_WHITE, -1);
         init_pair(8, COLOR_BLACK, -1);
-        init_pair(9, COLOR_BLACK, COLOR_CYAN);     // Compute & SoC
-        init_pair(10, COLOR_BLACK, COLOR_GREEN);   // Gigabit Ethernet
-        init_pair(11, COLOR_BLACK, COLOR_YELLOW);  // Fieldbus
-        init_pair(12, COLOR_WHITE, COLOR_BLUE);    // USB Storage
-        init_pair(13, COLOR_WHITE, COLOR_MAGENTA); // Highlights
-        init_pair(14, COLOR_BLACK, COLOR_WHITE);   // Top Header
+        init_pair(9, COLOR_CYAN, -1);     // Compute & SoC title (transparent bg)
+        init_pair(10, COLOR_GREEN, -1);   // Gigabit Ethernet title (transparent bg)
+        init_pair(11, COLOR_YELLOW, -1);  // Fieldbus title (transparent bg)
+        init_pair(12, COLOR_MAGENTA, -1); // USB Storage title (transparent bg)
+        init_pair(13, COLOR_WHITE, -1);   // Highlights
+        init_pair(14, COLOR_CYAN, -1);    // Top Header title (transparent bg)
     }
 }
 
@@ -1450,22 +1698,17 @@ void shutdown_ncurses_ui() {
 }
 
 void run_tui_loop(RkTesterEngine& engine, UiState& ui) {
-    auto last_draw = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
-    auto last_hw_update = std::chrono::steady_clock::now() - std::chrono::milliseconds(500);
+    constexpr int kDrawIntervalMs = 250; // 4Hz 渲染兼顾流畅度与低 SSH/CPU 开销，按键时立即重绘
+    constexpr int kHwIntervalMs = 500;
+    auto last_draw = std::chrono::steady_clock::now() - std::chrono::milliseconds(kDrawIntervalMs);
+    auto last_hw_update = std::chrono::steady_clock::now() - std::chrono::milliseconds(kHwIntervalMs);
+    bool dirty = true;
 
     while (!g_quit_flag) {
-        int ch = getch();
-        if (ch != ERR) {
-            bool quit_req = ui.menu_open
-                                ? handle_menu_input(ch, engine, ui)
-                                : handle_dashboard_input(ch, engine, ui);
-            if (quit_req) break;
-        }
-
         auto now = std::chrono::steady_clock::now();
 
         // 1. 定时采样系统硬件负载状态 (每 500ms)
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_hw_update).count() >= 500) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_hw_update).count() >= kHwIntervalMs) {
             last_hw_update = now;
             std::string stress_warn = engine.check_stress_health();
             if (!stress_warn.empty()) ui.prompt_status = stress_warn;
@@ -1480,12 +1723,15 @@ void run_tui_loop(RkTesterEngine& engine, UiState& ui) {
             ui.mpp_freq = (ms.enc_freq_mhz > 0) ? ms.enc_freq_mhz : ms.dec_freq_mhz;
             std::tie(ui.used_ram, ui.tot_ram, ui.ram_pct) = engine.get_mem_stats();
             ui.thermals = engine.get_thermals();
+            ui.throttle = engine.get_throttle_state();
             ui.uptime = engine.get_uptime();
+            dirty = true;
         }
 
-        // 2. 定时渲染 TUI 界面 (每 100ms)
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() >= 100) {
+        // 2. 定时渲染 TUI 界面 (250ms 周期或有按键/状态变化时立即刷新)
+        if (dirty || std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() >= kDrawIntervalMs) {
             last_draw = now;
+            dirty = false;
             erase();
             int h = 0, w = 0;
             getmaxyx(stdscr, h, w);
@@ -1502,6 +1748,24 @@ void run_tui_loop(RkTesterEngine& engine, UiState& ui) {
             refresh();
         }
 
-        usleep(15000);
+        // 3. 事件驱动等待用户输入（替代 15ms 忙等轮询，按键零延迟响应且极低 CPU 占用）
+        auto after = std::chrono::steady_clock::now();
+        int draw_rem = kDrawIntervalMs - static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(after - last_draw).count());
+        int hw_rem = kHwIntervalMs - static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(after - last_hw_update).count());
+        int wait_ms = std::max(10, std::min(100, std::min(draw_rem, hw_rem)));
+        timeout(wait_ms);
+
+        int ch = getch();
+        if (ch != ERR) {
+            if (ch != KEY_RESIZE) {
+                bool quit_req = ui.menu_open
+                                    ? handle_menu_input(ch, engine, ui)
+                                    : handle_dashboard_input(ch, engine, ui);
+                if (quit_req) break;
+            }
+            dirty = true;
+        }
     }
 }

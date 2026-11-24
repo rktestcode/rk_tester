@@ -23,6 +23,7 @@ public:
     std::atomic<bool> active{false};
     std::atomic<ChannelState> state{ChannelState::STANDBY};
     std::atomic<CanDirection> dir{CanDirection::CAN0_TO_CAN1};
+    std::atomic<bool> fd_mode{false}; // false: CAN 2.0 8B 50fps | true: CAN-FD 64B 2Mbps 500fps
 
     std::atomic<uint64_t> tx_bytes{0};
     std::atomic<uint64_t> rx_bytes{0};
@@ -48,6 +49,8 @@ public:
 
     void cycle_direction();
     void set_direction(CanDirection d);
+    void toggle_fd_mode();
+    void set_fd_mode(bool en);
 
     std::string get_short_label() const;
     std::string get_wide_label() const;
@@ -58,14 +61,16 @@ public:
     std::string get_bitrate_info() const;
 
     void start();
+    void request_stop() { active.store(false); }
     void stop();
     void reset();
 
 private:
     struct PendingCanFrame {
         uint8_t seq{0};
+        uint8_t len{8};
         uint64_t send_time_us{0};
-        uint8_t expect_data[8]{};
+        uint8_t expect_data[64]{};
     };
 
     std::atomic<bool> reset_requested{false};
@@ -78,11 +83,12 @@ private:
     void clear_counters();
 
     static bool is_iface_up(const std::string& dev);
-    static std::string ensure_can_up(const std::string& dev);
+    static int get_iface_mtu(const std::string& dev);
+    static std::string ensure_can_up(const std::string& dev, bool force_fd_reinit = false);
     static void flush_can_socket(int s);
     static int open_socket(const std::string& ifname, canid_t filter_id, int& out_errno);
 
-    void process_rx(int s0, int s1, CanDirection cur_dir,
+    void process_rx(int s0, int s1, CanDirection cur_dir, bool cur_fd,
                     std::deque<PendingCanFrame>& pending_tx,
                     uint64_t& rx_calc);
     void run();

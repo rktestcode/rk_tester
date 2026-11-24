@@ -10,6 +10,7 @@ extern const std::string DEVFREQ_GPU;
 extern const std::string DEVFREQ_NPU;
 extern const std::string DEBUG_RKNPU_LOAD;
 extern const std::string DEBUG_RKRGA_LOAD;
+extern const std::string DEBUG_CLK_GPU;
 extern const std::string DEBUG_CLK_RGA;
 extern const std::string DEBUG_CLK_VENC;
 extern const std::string DEBUG_CLK_VDEC;

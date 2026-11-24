@@ -12,6 +12,7 @@ const std::string DEVFREQ_GPU = "/sys/class/devfreq/27800000.gpu";
 const std::string DEVFREQ_NPU = "/sys/class/devfreq/27700000.npu";
 const std::string DEBUG_RKNPU_LOAD = "/sys/kernel/debug/rknpu/load";
 const std::string DEBUG_RKRGA_LOAD = "/sys/kernel/debug/rkrga/load";
+const std::string DEBUG_CLK_GPU = "/sys/kernel/debug/clk/clk_gpu/clk_rate";
 const std::string DEBUG_CLK_RGA = "/sys/kernel/debug/clk/clk_core_rga2e_0/clk_rate";
 const std::string DEBUG_CLK_VENC = "/sys/kernel/debug/clk/clk_vepu0_core/clk_rate";
 const std::string DEBUG_CLK_VDEC = "/sys/kernel/debug/clk/clk_rkvdec_core/clk_rate";

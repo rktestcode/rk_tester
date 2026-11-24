@@ -1,6 +1,6 @@
 # RK3576 Unified Hardware Test Platform (rk_tester)
 
-专为 Rockchip RK3576 4路千兆网卡开发板打造的**一站式全功能终端测试工具**（全 ASCII/英文界面，彻底杜绝任何终端乱码与方块字问题）。集成四路网卡静态 IP 自动配置与链路监控、四路网口高频两两互 Ping 丢包监测（EMC/ESD/EFT抗扰度测试）、RS232/RS485 两两对接持续单向数据传输测试、双路 CAN 总线测试、4路 USB 存储设备并发读写校验压测，以及 CPU/GPU/NPU/RGA/RKMPP 全负荷硬件烤机于一体。
+专为 Rockchip RK3576 4路千兆网卡开发板打造的**一站式全功能终端测试工具**（全 ASCII/英文界面，彻底杜绝任何终端乱码与方块字问题）。集成四路网卡静态 IP 自动配置与链路监控、四路网口高频两两互 Ping 丢包监测及千兆高吞吐突发打流（EMC/ESD/EFT抗扰度与满载压测）、RS232/RS485 两两对接持续数据传输测试、双路 CAN / CAN-FD 总线压测、4路 USB 存储设备 4MB `O_DIRECT` 并发读写校验压测，以及 CPU/GPU/NPU/RGA/RKMPP/大容量 DDR 全负荷硬件烤机于一体。
 
 ---
 
@@ -15,7 +15,7 @@
 
 ### 2. 底层实现与物理链路穿透（独立 `poll()` 线程 + `AF_PACKET` 单播原始帧）
 - **物理线缆穿透**：常规 Linux IP 栈在同主机不同网口间通信时会被内核回环（Loopback）自动拦截，无法检验外部物理线缆与 PHY/EMC 性能。`rk_tester` 底层采用 **Layer-2 `AF_PACKET` (`SOCK_RAW`) 原始数据包引擎**，以对端真实单播 MAC 构造标准以太网帧 + IP + ICMP 报文直接推送至物理网卡队列，报文必须穿过板载 PHY 芯片与外部实体网线到达对端网口，对端网口接收后再通过物理线缆反射 Echo Reply。
-- **独立事件驱动线程**：EMC 发包/收包运行于独立的 `poll()` 事件驱动后台线程，与 TUI 渲染完全解耦，彻底消除轮询抖动，精准测量真实微秒级 RTT 延迟与 100ms 周期瞬态丢包。
+- **独立事件驱动线程与千兆高吞吐突发模式（`[T]` / `--lan-highload`）**：EMC 发包/收包运行于独立的 `poll()` 事件驱动后台线程，原始套接字内置内核态经典 BPF 过滤器（仅放行入向 IPv4 ICMP 报文，屏蔽自身 `PACKET_OUTGOING` 与管理口 SSH TCP 流量）与 2MB 收发缓冲区，采用 O(1) 环形在途槽位替代红黑树；按 **`T`**（或 `--lan-highload`）可在 **100ms EMC 监测档** 与 **1480B `sendmmsg`/`recvmmsg` 千兆突发打流档** 间无缝切换，实时显示各口与汇总 Mbps 吞吐量，并内置**双端 Link UP 安全护栏**（仅当本口与本机对端口均启用且 Carrier UP 时才突发打流，绝不会向单口连接的办公网交换机泛洪）。
 - **抗电磁干扰评级**：实时统计丢包率与链路 Flap 次数，自动评级 `CLASS A`（0 丢包 PASS）、`CLASS B`（<1% 自恢复）、`CLASS C`（存在掉线或丢包 FAIL），并同步记录详细事件流水至 `/tmp/emc_test_*.log`。
 
 ### 3. 网线热插拔自动恢复与丢包精准记录（Hotplug Auto-Recovery & Loss Logging）
@@ -37,7 +37,7 @@
    - 测试通过在挂载目录下生成隐藏临时测试块（`/.rk_test_io_slot<N>.dat`）进行循环读写验证。
 
 3. **并发高强度读写与真实硬件介质校验**：
-   - 4 颗独立线程同时对 4 路 USB 设备以 1MB 数据块循环执行：写入 -> `fdatasync` 强制落盘 -> `posix_fadvise(POSIX_FADV_DONTNEED)` 驱逐内核页缓存 -> 从硬件重新读取 -> 内存逐字节校验（`memcmp`） -> 删除临时文件，杜绝页缓存假阳性。
+   - 4 颗独立线程同时对 4 路 USB 设备以 **4MB（4KB 对齐）大块**与常驻文件句柄（`pwrite`/`pread`）持续循环执行：优先以 `O_DIRECT` 绕过页缓存直接落盘并逐字节校验（不支持 `O_DIRECT` 的文件系统如部分 FUSE/NTFS 自动无缝回退 `fdatasync` + `posix_fadvise(POSIX_FADV_DONTNEED)`），消除频繁建删文件与人为休眠开销，充分释放 USB 3.0 顺序吞吐与总线功耗。
    - 界面实时显示总写入/读取量（MB）、总写速与读速（MB/s）、错误次数与各盘详情；退出时打印含设备型号、容量、挂载点与校验结果的完整报告。
 
 4. **U 盘/移动硬盘热插拔自动恢复与盘符漂移自愈**：
@@ -73,24 +73,25 @@
 2. **模式二：`CAN1 -> CAN0 (Uni)`（反向单向）**：CAN1 每 20ms 发送 8 字节标准帧（ID `0x221`，同步字 `0xC1`），CAN0 接收校验。
 3. **模式三：`CAN0 <-> CAN1 (Ping-Pong)`（半双工交替应答）**：CAN0 发送 Ping -> CAN1 校验后回复 Pong -> CAN0 匹配在途帧序号完成闭环验证。
 
-### 2. 自动链路拉起、硬件总线错误监控与丰富展示
+### 2. CAN-FD 64B @ 2Mbps 高频压力档、自动链路拉起与硬件总线错误监控
 - 自动检测 `IFF_UP` 状态，优先按 CAN-FD（500k / 2M）拉起，不支持时自动回退标准 500kbps CAN 2.0。
+- 支持随时按 **`F`**（或启动参数 `--can-fd`）在 **CAN 2.0 标准档（8B, 50fps）** 与 **CAN-FD 压力档（64B + `CANFD_BRS` 2Mbps, 2ms/500fps）** 间切换（若网卡未启用 FD MTU>=72 则自动重新拉起或无缝回退）。
 - 开启 `CAN_RAW_ERR_FILTER` 硬件错误帧监控，实时捕捉 Bus-Off、ACK 缺失、位错误并统计 `Bus` 总线错误计数。
-- 接收端对**全部 8 字节数据帧进行校验和 + 逐字节一致性比对**（Ping-Pong 模式下回发异或变换载荷并在源端逐字节校验），状态栏同样以 `[COMM]`/`[WAIT]`/`[NORX]`/`[IDLE]` 反映实时通信状态，历史错误在 `E:`/`CRC:`/`Bus:` 持续累计；切换方向自动插入 30ms 静默排空窗口。
+- 接收端对**全部数据载荷（8B 或 64B）进行校验和 + 逐字节一致性比对**（Ping-Pong 模式下回发异或变换载荷并在源端逐字节校验），状态栏同样以 `[COMM]`/`[WAIT]`/`[NORX]`/`[IDLE]` 反映实时通信状态，历史错误在 `E:`/`CRC:`/`Bus:` 持续累计；切换方向或 FD 档位自动插入 30ms 静默排空窗口。
 
 ### 3. 启动参数与切换方式
-- **运行中切换**：主界面或菜单内按 **`D`** 循环切换 CAN 方向（在菜单中光标停在 RS232/RS485 时按 `D` 也可切换对应串口方向）。
-- **启动参数**：`sudo rk_tester --can-0to1` / `--can-1to0` / `--can-pingpong`。
+- **运行中切换**：主界面或菜单内按 **`D`** 循环切换 CAN 方向，按 **`F`** 切换 CAN 2.0 / CAN-FD 64B 模式（在菜单中光标停在 RS232/RS485 时按 `D` 也可切换对应串口方向）。
+- **启动参数**：`sudo rk_tester --can-0to1` / `--can-1to0` / `--can-pingpong` / `--can-fd`。
 
 ---
 
 ## 五、四大独立硬件功能板块与高对比度仪表盘布局
 
 仪表盘按硬件功能域划分为 **4 个独立板块**，配高对比度彩色实体徽标栏与动态自适应布局：
-1. **【板块 1：计算加速与 SoC 监控】`[1-4,0,V] COMPUTE & SOC ACCELERATORS`（青底黑字）**：CPU 8 核（4×A53 + 4×A72）负载与主频、Mali-G52 GPU（Panfrost EGL/GLES）压测、RK-NPU 双核 6 TOPS 矩阵压测、RGA2 双核 4K 2D CSC/旋转压测、RKMPP 双通道 4K H.265 VENC+VDEC 编解码并发压测、内存占用与 SoC/Big/GPU/NPU 温度。
-2. **【板块 2：四路千兆以太网与 EMC 监测】`[5] 4-PORT GIGABIT ETHERNET`（绿底黑字）**：4 路网口物理链路状态、速率、发包/收包/丢包率、微秒级 RTT、EMC 综合评级与事件流水。
-3. **【板块 3：工业现场总线测试】`[6,7,9] INDUSTRIAL FIELDBUS`（黄底黑字）**：RS232、RS485 与 CAN 总线实时速率、帧率、错误计数与状态标签。
-4. **【板块 4：高速 USB 存储读写压测】`[8] 4-PORT USB STORAGE`（蓝底白字）**：总读写量与速率汇总 + 4 路独立盘体实时状态。
+1. **【板块 1：计算加速与 SoC/DDR 监控】`[1-4,0,V,B] COMPUTE & SOC/DDR`（青底黑字）**：CPU 8 核（4×A53 + 4×A72，支持 `--keep-isolcpus` 保留实时隔离核）负载与主频、Mali-G52 GPU（Panfrost 双 FBO 纹理采样 + FMA 着色器压测，直接读取硬件时钟 `clk_gpu` 并在 IPA 温控降频时高亮 `!` / `[THR]`）、RK-NPU 双核 6 TOPS 伪随机矩阵压测、RGA2 双核 4K 2D CSC/旋转压测、RKMPP 双通道 4K H.265 VENC+VDEC 编解码并发压测、**大容量 DDR 带宽与位翻转校验压测（`[B]`，4 线程 `SCHED_IDLE` + `mmap`/`MADV_HUGEPAGE` + 128-bit NEON 4 阶段位翻转模式，自动保留 >=768MB 系统余量防 OOM，实时监测 GB/s 带宽与 Bit Error）**、内存占用与 SoC/Big/GPU/NPU 温度；所有内部压测子进程均绑定 `PR_SET_PDEATHSIG`，杜绝异常退出残留孤儿进程。
+2. **【板块 2：四路千兆以太网与 EMC/高吞吐监测】`[5/T] 4-PORT GIGABIT ETHERNET`（绿底黑字）**：4 路网口物理链路状态、速率、发包/收包/丢包率、微秒级 RTT / 实时 Mbps 吞吐量、EMC 综合评级与事件流水。
+3. **【板块 3：工业现场总线测试】`[6,7,9/F] INDUSTRIAL FIELDBUS`（黄底黑字）**：RS232、RS485 与 CAN/CAN-FD 总线实时速率、帧率、错误计数与状态标签。
+4. **【板块 4：高速 USB 存储读写压测】`[8] 4-PORT USB STORAGE`（蓝底白字）**：4MB `O_DIRECT` 总读写量与速率汇总 + 4 路独立盘体实时状态。
 5. **动态终端自适应**：自动适配紧凑模式（最小 `76x23`，标准 `80x24`）与宽屏模式（高度 `>= 30` 行展开 8 核图形条与以太网事件流水）。
 
 ---
@@ -100,7 +101,8 @@
 随时按 **`M`** 或使用 `sudo rk_tester -m` 启动即可呼出交互式勾选菜单：
 - **`↑` / `↓` / `←` / `→`**：移动光标选择测试项、网口过滤项或操作按钮。
 - **`Space` / `Enter`**：切换勾选状态 `[X]` / `[ ]`。
-- **`0..9` / `V`**：快速切换对应测试项（`0`=RGA，`V`=RKMPP，`4` 快速切换 CPU+GPU+NPU+RGA+RKMPP 五引擎全烤机）。
+- **`0..9` / `V` / `B`**：快速切换对应测试项（`0`=RGA，`V`=RKMPP，`B`=DDR 内存压测，`4` 快速切换 CPU+GPU+NPU+RGA+RKMPP+DDR 六引擎全烤机）。
+- **`T` / `F`**：快速切换 4-LAN 千兆突发模式（1480B Burst）与 CAN-FD 64B 2Mbps 压力档。
 - **`Z` / `X` / `D`**：分别切换 RS232 / RS485 / CAN 传输方向（光标停在 RS232 或 RS485 上时按 `D` 也可直接切换该项方向）。
 - **`A` / `N`**：一键全选 / 全清。
 - **`S`** 或选中 `[ Apply & Run ]` 回车：应用勾选配置并自动保存至 `/etc/rk_tester.conf`（下次启动自动记住上次选择）。
@@ -129,16 +131,19 @@
 | **`3`** | **开启 / 停止 RKNPU 双核 6 TOPS 满频（950MHz）MatMul 压测** |
 | **`0`** | **开启 / 停止 RGA2 双核 4K 2D CSC+旋转压测（DMA-BUF 零拷贝）** |
 | **`V`** | **开启 / 停止 RKMPP 双通道 4K H.265 VENC+VDEC 硬件编解码回环压测** |
-| **`4`** | **一键全烤机（同时切换 CPU + GPU + NPU + RGA + RKMPP 全负荷）** |
-| **`5`** | **开启 / 暂停 4-LAN 两两互 Ping 丢包监测（100ms 周期）** |
+| **`B`** | **开启 / 停止大容量 DDR 带宽与 4 阶段位翻转完整性校验压测（NEON）** |
+| **`4`** | **一键全烤机（同时切换 CPU + GPU + NPU + RGA + RKMPP + DDR 全负荷）** |
+| **`5`** | **开启 / 暂停 4-LAN 两两互 Ping 监测 / 千兆突发打流** |
+| **`T`** | **切换 4-LAN 模式（`100ms EMC 监测` <-> `1480B 千兆高吞吐突发打流`）** |
 | **`6`** | **开启 / 暂停 RS232 串口传输测试（ttyS0 / ttyS1）** |
 | **`7`** | **开启 / 暂停 RS485 串口传输测试（ttyS2 / ttyS3）** |
-| **`8`** | **开启 / 暂停 4 路 USB 存储并发读写校验压测（sda..sdd）** |
-| **`9`** | **开启 / 暂停 CAN 总线传输测试（can0 / can1）** |
+| **`8`** | **开启 / 暂停 4 路 USB 存储 4MB `O_DIRECT` 并发读写校验压测（sda..sdd）** |
+| **`9`** | **开启 / 暂停 CAN / CAN-FD 总线传输测试（can0 / can1）** |
+| **`F`** | **切换 CAN 模式（`CAN 2.0 8B 50fps` <-> `CAN-FD 64B 2Mbps 500fps`）** |
 | **`Z`** | **切换 RS232 传输方向（`S0->S1` / `S1->S0` / `S0<->S1 Ping-Pong`）** |
 | **`X`** | **切换 RS485 传输方向（`S2->S3` / `S3->S2` / `S2<->S3 Ping-Pong`）** |
 | **`D`** | **切换 CAN 传输方向（`CAN0->1` / `CAN1->0` / `CAN0<->1 Ping-Pong`）** |
-| **`R`** | **清零重置所有统计计数（网口、串口、CAN、USB 全部归零）** |
+| **`R`** | **清零重置所有统计计数（DDR、网口、串口、CAN、USB 全部归零）** |
 | **`P`** | **切换调频策略（`PERFORMANCE` / `SCHEDUTIL`）** |
 | **`I`** | **重新初始化四路网卡静态 IP 与原始套接字** |
 | **`Q`** | **安全退出并打印全套终端测试总结报告** |
@@ -152,11 +157,12 @@
 src/
 ├── common.{hpp,cpp}        # 公共常量、信号退出标志、校验和与工具函数
 ├── accel_burn.{hpp,cpp}    # 内置 GPU (Panfrost EGL/GLES) / NPU (RKNN) / RGA (IM2D) / RKMPP (H.265 编解码) 原生压测工作进程
+├── ddr_tester.{hpp,cpp}    # 大容量 DDR 带宽与 4 阶段位翻转完整性校验引擎（NEON + mmap）
 ├── serial_tester.{hpp,cpp} # RS232 / RS485 收发校验引擎
-├── can_tester.{hpp,cpp}    # SocketCAN 收发校验与总线错误监控引擎
-├── usb_tester.{hpp,cpp}    # 4 路 USB 存储自动挂载、漂移恢复与读写校验引擎
-├── net_emc.{hpp,cpp}       # 4 路千兆网卡 AF_PACKET 互 Ping 与 EMC 监测引擎
-├── soc_engine.{hpp,cpp}    # SoC 监控与 CPU/GPU/NPU/RGA/RKMPP 压测调度总控
+├── can_tester.{hpp,cpp}    # SocketCAN / CAN-FD 64B 收发校验与总线错误监控引擎
+├── usb_tester.{hpp,cpp}    # 4 路 USB 存储自动挂载、漂移恢复与 4MB O_DIRECT 读写校验引擎
+├── net_emc.{hpp,cpp}       # 4 路千兆网卡 AF_PACKET 互 Ping / 1480B 突发打流与 EMC 监测引擎
+├── soc_engine.{hpp,cpp}    # SoC 监控与 CPU/GPU/NPU/RGA/RKMPP/DDR 压测调度总控
 ├── config_store.{hpp,cpp}  # 测试配置持久化 (/etc/rk_tester.conf)
 ├── tui.{hpp,cpp}           # ncurses 仪表盘、勾选菜单与退出汇总报告
 └── main.cpp                # CLI 参数解析与程序主入口
@@ -179,6 +185,9 @@ sudo rk_tester
 # 开机直接进入测试项勾选菜单模式
 sudo rk_tester -m
 
-# 指定 CAN 初始测试方向启动
-sudo rk_tester --can-pingpong
+# 保留 RT 隔离核（CPU 6/7）不参与 CPU 烤机，便于并发运行 cyclictest 验证实时抖动
+sudo rk_tester --keep-isolcpus
+
+# 指定 CAN 初始测试方向与 CAN-FD 64B 2Mbps / 4-LAN 千兆突发模式启动
+sudo rk_tester --can-pingpong --can-fd --lan-highload
 ```

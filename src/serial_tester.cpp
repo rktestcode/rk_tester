@@ -3,9 +3,15 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -124,6 +130,9 @@ void SerialChannel::clear_counters() {
     rx_frames.store(0);
     err_frames.store(0);
     crc_errors.store(0);
+    hw_oe.store(0);
+    hw_fe.store(0);
+    hw_pe.store(0);
     speed_kb.store(0.0);
     tx_speed_kb.store(0.0);
     tx_fps.store(0.0);
@@ -214,6 +223,36 @@ void SerialChannel::drain_fd_into(int fd, std::vector<uint8_t>& buf, std::atomic
 void SerialChannel::discard_fd(int fd) {
     uint8_t tmp[256];
     while (read(fd, tmp, sizeof(tmp)) > 0) {}
+}
+
+bool SerialChannel::read_uart_hw_errors(const std::string& dev_path, uint64_t& oe, uint64_t& fe, uint64_t& pe) {
+    oe = 0;
+    fe = 0;
+    pe = 0;
+    size_t pos = dev_path.rfind("ttyS");
+    if (pos == std::string::npos) return false;
+    std::string prefix = dev_path.substr(pos + 4) + ":";
+
+    FILE* f = std::fopen("/proc/tty/driver/serial", "r");
+    if (!f) return false;
+    char line[256];
+    bool found = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, prefix.c_str(), prefix.size()) == 0) {
+            auto parse_tok = [&](const char* key) -> uint64_t {
+                const char* p = std::strstr(line, key);
+                if (!p) return 0;
+                return static_cast<uint64_t>(std::strtoull(p + std::strlen(key), nullptr, 10));
+            };
+            oe = parse_tok("oe:");
+            fe = parse_tok("fe:");
+            pe = parse_tok("pe:");
+            found = true;
+            break;
+        }
+    }
+    std::fclose(f);
+    return found;
 }
 
 void SerialChannel::match_rx_stream(std::vector<uint8_t>& rx_buf, uint8_t exp_s1, uint8_t exp_s2,
@@ -311,6 +350,18 @@ void SerialChannel::process_rx(int fd_a, int fd_b, SerialDirection cur_dir,
 }
 
 void SerialChannel::run() {
+    // 提升为低层级实时优先级（SCHED_FIFO 20，低于内核中断线程 FIFO 50，高于所有普通烤机线程），
+    // 消除满载 CPU 竞争引起的串口用户态唤醒抖动与 RTT 尖峰
+    struct sched_param rt_sp{};
+    rt_sp.sched_priority = 20;
+    int rt_pol = SCHED_FIFO;
+#ifdef SCHED_RESET_ON_FORK
+    rt_pol |= SCHED_RESET_ON_FORK;
+#endif
+    if (pthread_setschedparam(pthread_self(), rt_pol, &rt_sp) != 0) {
+        setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), -10);
+    }
+
     int err_a = 0, err_b = 0;
     int fd_a = open_port(tx_dev, err_a);
     int fd_b = open_port(rx_dev, err_b);
@@ -338,15 +389,28 @@ void SerialChannel::run() {
     rx_buf_b.reserve(2048);
     std::deque<PendingSerialFrame> pending_tx;
 
-    auto last_send = std::chrono::steady_clock::now();
+    auto next_tx = std::chrono::steady_clock::now();
     auto last_calc = std::chrono::steady_clock::now();
+    auto last_hw_poll = std::chrono::steady_clock::now();
     auto settle_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
     bool in_settle = true;
+    bool rx_ready = true;
     uint64_t tx_bytes_since_calc = 0;
     uint64_t tx_frames_since_calc = 0;
     uint64_t rx_bytes_since_calc = 0;
     uint64_t rx_frames_since_calc = 0;
     const uint64_t RX_TIMEOUT_US = 500000; // 500ms 判定超时丢帧
+
+    uint64_t base_oe = 0, base_fe = 0, base_pe = 0;
+    auto sample_hw_sum = [&](uint64_t& sum_oe, uint64_t& sum_fe, uint64_t& sum_pe) {
+        uint64_t oe_a = 0, fe_a = 0, pe_a = 0, oe_b = 0, fe_b = 0, pe_b = 0;
+        read_uart_hw_errors(tx_dev, oe_a, fe_a, pe_a);
+        read_uart_hw_errors(rx_dev, oe_b, fe_b, pe_b);
+        sum_oe = oe_a + oe_b;
+        sum_fe = fe_a + fe_b;
+        sum_pe = pe_a + pe_b;
+    };
+    sample_hw_sum(base_oe, base_fe, base_pe);
 
     SerialDirection cur_dir = dir.load();
 
@@ -369,11 +433,14 @@ void SerialChannel::run() {
             rx_bytes_since_calc = 0;
             rx_frames_since_calc = 0;
             clear_counters();
+            sample_hw_sum(base_oe, base_fe, base_pe);
             auto tnow = std::chrono::steady_clock::now();
             last_calc = tnow;
+            last_hw_poll = tnow;
             // 切方向后进入 60ms 静默排空窗口，等 UART 硬件 TX FIFO 与总线残留彻底结束再发新帧
             settle_until = tnow + std::chrono::milliseconds(dir_changed ? 60 : 25);
             in_settle = true;
+            rx_ready = true;
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -390,17 +457,24 @@ void SerialChannel::run() {
             tcflush(fd_b, TCIOFLUSH);
             discard_fd(fd_a);
             discard_fd(fd_b);
+            sample_hw_sum(base_oe, base_fe, base_pe);
             in_settle = false;
-            last_send = now - std::chrono::milliseconds(40);
+            next_tx = now;
             last_calc = now;
+            last_hw_poll = now;
+            rx_ready = true;
         }
 
         uint64_t now_us = get_time_us();
 
-        // 单向每 20ms 发一帧 (~50F/s)；Ping-Pong 半双工每 30ms 发一轮，确保 RS485 方向切换无冲突
+        // 单向每 20ms 固定相位发一帧 (50F/s)；Ping-Pong 半双工每 30ms 发一轮，确保 RS485 方向切换无冲突
         int tx_interval_ms = (cur_dir == SerialDirection::PING_PONG) ? 30 : 20;
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send).count() >= tx_interval_ms) {
-            last_send = now;
+        const auto tx_period = std::chrono::milliseconds(tx_interval_ms);
+        if (now >= next_tx) {
+            next_tx += tx_period;
+            if (next_tx <= now - tx_period) {
+                next_tx = now + tx_period;
+            }
             uint16_t tx_seq = cur_seq++;
             SerialFrame frame = (cur_dir == SerialDirection::B_TO_A)
                                     ? build_frame(0x55, 0xAA, tx_seq, 2)
@@ -424,15 +498,20 @@ void SerialChannel::run() {
                     std::memcpy(pf.expect_payload, frame.payload, 58);
                 }
                 pending_tx.push_back(pf);
+                if (cur_dir == SerialDirection::A_TO_B) discard_fd(fd_a);
+                else if (cur_dir == SerialDirection::B_TO_A) discard_fd(fd_b);
             } else {
                 tx_frames.fetch_add(1);
                 err_frames.fetch_add(1);
             }
         }
 
-        // 2. RX
-        process_rx(fd_a, fd_b, cur_dir, rx_buf_a, rx_buf_b, pending_tx,
-                   rx_bytes_since_calc, rx_frames_since_calc);
+        // 2. RX（仅在 poll 提示可读时执行系统调用，避免空读）
+        if (rx_ready) {
+            process_rx(fd_a, fd_b, cur_dir, rx_buf_a, rx_buf_b, pending_tx,
+                       rx_bytes_since_calc, rx_frames_since_calc);
+            rx_ready = false;
+        }
 
         // 3. 超时丢帧检测
         now_us = get_time_us();
@@ -457,7 +536,25 @@ void SerialChannel::run() {
             rx_frames_since_calc = 0;
         }
 
-        // 单向模式仅 poll 接收端，Ping-Pong 模式 poll 双端；遇到异常事件退避，杜绝 100% CPU 空转
+        // 5. 每 1000ms 采样一次内核 UART 硬件错误计数 (oe/fe/pe)
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_hw_poll).count() >= 1000) {
+            last_hw_poll = now;
+            uint64_t cur_oe = 0, cur_fe = 0, cur_pe = 0;
+            sample_hw_sum(cur_oe, cur_fe, cur_pe);
+            hw_oe.store(cur_oe >= base_oe ? (cur_oe - base_oe) : 0);
+            hw_fe.store(cur_fe >= base_fe ? (cur_fe - base_fe) : 0);
+            hw_pe.store(cur_pe >= base_pe ? (cur_pe - base_pe) : 0);
+        }
+
+        // 纳秒级 ppoll() 精确休眠至下一固定发包相位，消除毫秒取整漂移；有串口数据到达立即唤醒
+        auto after = std::chrono::steady_clock::now();
+        long long rem_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(next_tx - after).count();
+        if (rem_ns < 0) rem_ns = 0;
+        if (rem_ns > 50000000LL) rem_ns = 50000000LL;
+        struct timespec ts{};
+        ts.tv_sec = static_cast<time_t>(rem_ns / 1000000000LL);
+        ts.tv_nsec = static_cast<long>(rem_ns % 1000000000LL);
+
         struct pollfd pfds[2];
         nfds_t nfds = 0;
         if (cur_dir == SerialDirection::A_TO_B) {
@@ -468,13 +565,14 @@ void SerialChannel::run() {
             pfds[nfds++] = {fd_a, POLLIN, 0};
             pfds[nfds++] = {fd_b, POLLIN, 0};
         }
-        int pr = poll(pfds, nfds, 2);
+        int pr = ppoll(pfds, nfds, &ts, nullptr);
         if (pr > 0) {
             bool got_in = false;
             for (nfds_t i = 0; i < nfds; ++i) {
                 if (pfds[i].revents & POLLIN) got_in = true;
             }
-            if (!got_in) usleep(2000);
+            if (got_in) rx_ready = true;
+            else usleep(2000);
         }
     }
 

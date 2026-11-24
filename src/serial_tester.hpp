@@ -42,6 +42,9 @@ public:
     std::atomic<uint64_t> rx_frames{0};
     std::atomic<uint64_t> err_frames{0};
     std::atomic<uint64_t> crc_errors{0};
+    std::atomic<uint64_t> hw_oe{0};
+    std::atomic<uint64_t> hw_fe{0};
+    std::atomic<uint64_t> hw_pe{0};
     std::atomic<double> speed_kb{0.0};
     std::atomic<double> tx_speed_kb{0.0};
     std::atomic<double> tx_fps{0.0};
@@ -70,6 +73,7 @@ public:
     std::string get_error_detail() const;
 
     void start();
+    void request_stop() { active.store(false); }
     void stop();
     void reset();
 
@@ -93,6 +97,7 @@ private:
     static SerialFrame build_frame(uint8_t s1, uint8_t s2, uint16_t seq, uint8_t salt);
     static void drain_fd_into(int fd, std::vector<uint8_t>& buf, std::atomic<uint64_t>* byte_counter);
     static void discard_fd(int fd);
+    static bool read_uart_hw_errors(const std::string& dev_path, uint64_t& oe, uint64_t& fe, uint64_t& pe);
 
     void match_rx_stream(std::vector<uint8_t>& rx_buf, uint8_t exp_s1, uint8_t exp_s2,
                          std::deque<PendingSerialFrame>& pending_tx,

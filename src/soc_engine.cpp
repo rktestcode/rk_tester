@@ -6,12 +6,12 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <pthread.h>
-#include <regex>
 #include <sched.h>
-#include <sstream>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -23,10 +23,13 @@
 namespace {
 
 std::string read_text_token(const std::string& path) {
-    std::ifstream f(path);
-    std::string s;
-    if (f.is_open() && (f >> s)) return s;
-    return "";
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return "";
+    char buf[128]{};
+    std::string res;
+    if (std::fscanf(f, "%127s", buf) == 1) res = buf;
+    std::fclose(f);
+    return res;
 }
 
 void write_text_value(const std::string& path, const std::string& val) {
@@ -34,49 +37,68 @@ void write_text_value(const std::string& path, const std::string& val) {
     if (f.is_open()) f << val;
 }
 
+long long read_ll_file(const std::string& path, long long def_val = 0) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return def_val;
+    long long v = def_val;
+    if (std::fscanf(f, "%lld", &v) != 1) v = def_val;
+    std::fclose(f);
+    return v;
+}
+
 int read_debugfs_clk_mhz(const std::string& path) {
-    std::ifstream f(path);
-    if (!f.is_open()) return 0;
-    long long hz = 0;
-    if (f >> hz && hz > 0) {
-        return static_cast<int>(hz / 1000000);
+    long long hz = read_ll_file(path, 0);
+    return (hz > 0) ? static_cast<int>(hz / 1000000) : 0;
+}
+
+pid_t spawn_internal_worker(const char* flag) {
+    pid_t parent_pid = getpid();
+    pid_t pid = fork();
+    if (pid == 0) {
+        // 绑定父进程退出信号：即使父进程被 SIGKILL 或 SSH 断线，子进程也会立刻收到 SIGTERM 自动清理，杜绝孤儿烤机进程
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() != parent_pid) _exit(0);
+        setsid();
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execl("/proc/self/exe", "rk_tester", flag, nullptr);
+        _exit(127);
     }
-    return 0;
+    return pid;
 }
 
 void read_mpp_irq_counts(uint64_t& enc_irqs, uint64_t& dec_irqs) {
     enc_irqs = 0;
     dec_irqs = 0;
-    std::ifstream f("/proc/interrupts");
-    if (!f.is_open()) return;
-    std::string line;
-    while (std::getline(f, line)) {
-        bool is_enc = (line.find("rkvenc") != std::string::npos);
-        bool is_dec = (line.find("rkvdec") != std::string::npos);
+    FILE* f = std::fopen("/proc/interrupts", "r");
+    if (!f) return;
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        bool is_enc = (std::strstr(line, "rkvenc") != nullptr);
+        bool is_dec = (std::strstr(line, "rkvdec") != nullptr);
         if (!is_enc && !is_dec) continue;
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::istringstream ss(line.substr(colon + 1));
-        std::string tok;
+        char* p = std::strchr(line, ':');
+        if (!p) continue;
+        ++p;
         uint64_t sum = 0;
-        while (ss >> tok) {
-            bool all_digits = !tok.empty();
-            for (char c : tok) {
-                if (c < '0' || c > '9') {
-                    all_digits = false;
-                    break;
-                }
-            }
-            if (!all_digits) break;
-            try {
-                sum += std::stoull(tok);
-            } catch (...) {
-                break;
-            }
+        while (*p) {
+            while (*p == ' ' || *p == '\t') ++p;
+            if (*p < '0' || *p > '9') break;
+            char* endp = nullptr;
+            unsigned long long v = std::strtoull(p, &endp, 10);
+            if (!endp || endp == p) break;
+            if (*endp != ' ' && *endp != '\t' && *endp != '\n' && *endp != '\0') break;
+            sum += static_cast<uint64_t>(v);
+            p = endp;
         }
         if (is_enc) enc_irqs += sum;
         if (is_dec) dec_irqs += sum;
     }
+    std::fclose(f);
 }
 
 void stop_child_process(pid_t& pid) {
@@ -105,9 +127,11 @@ RkTesterEngine::RkTesterEngine() {
     target_cpu_cores = num_cores;
     prev_cores.resize(num_cores);
     smooth_cores.resize(num_cores, 0.0);
+    rebuild_cpu_burn_list();
 
     init_governor_state();
     init_thermals();
+    init_cooling_devices();
     read_mpp_irq_counts(mpp_base_enc_irqs, mpp_base_dec_irqs);
     prev_mpp_enc_irqs = mpp_base_enc_irqs;
     prev_mpp_dec_irqs = mpp_base_dec_irqs;
@@ -160,6 +184,7 @@ void RkTesterEngine::setup_default_network() {
 }
 
 void RkTesterEngine::reset_all_stats() {
+    ddr_tester.reset();
     net_emc.reset_stats();
     rs232.reset();
     rs485.reset();
@@ -171,16 +196,35 @@ void RkTesterEngine::reset_all_stats() {
     prev_mpp_sample_us = get_time_us();
 }
 
+void RkTesterEngine::set_keep_isolcpus(bool keep) {
+    keep_isolcpus = keep;
+    rebuild_cpu_burn_list();
+}
+
+int RkTesterEngine::get_active_cpu_burn_cores() const {
+    return static_cast<int>(cpu_burn_cores.size());
+}
+
 void RkTesterEngine::toggle_cpu_stress() {
     if (cpu_stress.load()) {
         cpu_stress.store(false);
+        // 停止时将 SCHED_IDLE 线程提权回 SCHED_OTHER，避免被其他普通优先级进程饿死导致 join 卡顿
+        struct sched_param sp{};
+        sp.sched_priority = 0;
+        for (auto& t : cpu_threads) {
+            if (t.joinable()) {
+                pthread_setschedparam(t.native_handle(), SCHED_OTHER, &sp);
+            }
+        }
         for (auto& t : cpu_threads) {
             if (t.joinable()) t.join();
         }
         cpu_threads.clear();
     } else {
         cpu_stress.store(true);
-        for (int i = 0; i < target_cpu_cores; ++i) {
+        if (cpu_burn_cores.empty()) rebuild_cpu_burn_list();
+        for (int core_id : cpu_burn_cores) {
+            int i = core_id;
             cpu_threads.emplace_back([this, i]() {
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
@@ -228,8 +272,8 @@ void RkTesterEngine::toggle_cpu_stress() {
 
                 size_t stream_pos = 0;
                 while (this->cpu_stress.load(std::memory_order_relaxed)) {
-                    // Phase 1: 高位翻转率 12-way NEON FMA 满发射算力烤机
-                    for (int k = 0; k < 24000; ++k) {
+                    // Phase 1: 高位翻转率 12-way NEON FMA 满发射算力烤机（缩短单轮周期兼顾满负载与毫秒级退出响应）
+                    for (int k = 0; k < 4000; ++k) {
                         v0  = vfmaq_f32(k_add, v0,  k_mul);
                         v1  = vfmaq_f32(k_add, v1,  k_mul);
                         v2  = vfmaq_f32(k_add, v2,  k_mul);
@@ -256,9 +300,10 @@ void RkTesterEngine::toggle_cpu_stress() {
                         v10 = vfmsq_f32(k_sub, v10, k_mul);
                         v11 = vfmsq_f32(k_sub, v11, k_mul);
                     }
+                    if (!this->cpu_stress.load(std::memory_order_relaxed)) break;
 
                     // Phase 2: NEON 向量流式读写 (L1/L2/DDR 带宽压测)
-                    constexpr size_t kChunk = 65536; // 256KB per pass, sweeps full 4MB
+                    constexpr size_t kChunk = 32768; // 128KB per pass, sweeps full 4MB
                     float* pa = buf_a.data() + stream_pos;
                     const float* pb = buf_b.data() + stream_pos;
                     for (size_t j = 0; j < kChunk; j += 16) {
@@ -286,13 +331,14 @@ void RkTesterEngine::toggle_cpu_stress() {
                 float acc[8] = {1.12f, 0.88f, 1.23f, 0.77f, 1.15f, 0.85f, 1.19f, 0.81f};
                 size_t stream_pos = 0;
                 while (this->cpu_stress.load(std::memory_order_relaxed)) {
-                    for (int k = 0; k < 24000; ++k) {
+                    for (int k = 0; k < 4000; ++k) {
                         for (int u = 0; u < 8; ++u) {
                             acc[u] = std::fmaf(acc[u], 0.751953125f, 0.3712345f);
                             acc[u] = 1.8734567f - acc[u] * 0.751953125f;
                         }
                     }
-                    constexpr size_t kChunk = 32768;
+                    if (!this->cpu_stress.load(std::memory_order_relaxed)) break;
+                    constexpr size_t kChunk = 16384;
                     for (size_t j = 0; j < kChunk; ++j) {
                         size_t p = (stream_pos + j) % kElems;
                         buf_a[p] = std::fmaf(buf_a[p], 0.625f, buf_b[p] * 0.375f);
@@ -335,18 +381,8 @@ std::string RkTesterEngine::toggle_gpu_stress() {
         write_text_value(DEVFREQ_GPU + "/governor", "performance");
         gpu_gov_boosted = true;
     }
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        execl("/proc/self/exe", "rk_tester", "--internal-gpu-burn", nullptr);
-        _exit(127);
-    } else if (pid > 0) {
+    pid_t pid = spawn_internal_worker("--internal-gpu-burn");
+    if (pid > 0) {
         gpu_pid = pid;
         gpu_stress.store(true);
         return "Mali-G52 GPU Panfrost EGL/GLES stress STARTED (full-freq).";
@@ -405,6 +441,8 @@ std::string RkTesterEngine::check_stress_health() {
             return "RKMPP stress exited unexpectedly (check librockchip_mpp.so / /dev/mpp_service).";
         }
     }
+    std::string ddr_warn = ddr_tester.check_health();
+    if (!ddr_warn.empty()) return ddr_warn;
     return "";
 }
 
@@ -437,18 +475,8 @@ std::string RkTesterEngine::toggle_npu_stress() {
         npu_gov_boosted = true;
     }
     npu_pids.clear();
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        execl("/proc/self/exe", "rk_tester", "--internal-npu-burn", nullptr);
-        _exit(127);
-    } else if (pid > 0) {
+    pid_t pid = spawn_internal_worker("--internal-npu-burn");
+    if (pid > 0) {
         npu_pids.push_back(pid);
         npu_stress.store(true);
         return "RKNPU dual-core 6 TOPS MatMul stress STARTED (950MHz full-freq).";
@@ -468,18 +496,8 @@ std::string RkTesterEngine::toggle_rga_stress() {
         return "RGA unavailable: install librga.so and check /dev/rga permissions.";
     }
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        execl("/proc/self/exe", "rk_tester", "--internal-rga-burn", nullptr);
-        _exit(127);
-    } else if (pid > 0) {
+    pid_t pid = spawn_internal_worker("--internal-rga-burn");
+    if (pid > 0) {
         rga_pid = pid;
         rga_stress.store(true);
         return "RGA2 dual-core 4K 2D stress STARTED (native built-in).";
@@ -499,18 +517,8 @@ std::string RkTesterEngine::toggle_mpp_stress() {
         return "RKMPP unavailable: check librockchip_mpp.so and /dev/mpp_service.";
     }
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        execl("/proc/self/exe", "rk_tester", "--internal-mpp-burn", nullptr);
-        _exit(127);
-    } else if (pid > 0) {
+    pid_t pid = spawn_internal_worker("--internal-mpp-burn");
+    if (pid > 0) {
         mpp_pid = pid;
         mpp_stress.store(true);
         return "RKMPP dual-4K H.265 VENC+VDEC stress STARTED (native built-in).";
@@ -518,25 +526,75 @@ std::string RkTesterEngine::toggle_mpp_stress() {
     return "RKMPP stress failed to fork.";
 }
 
+std::string RkTesterEngine::toggle_ddr_stress() {
+    if (ddr_tester.active.load()) {
+        ddr_tester.stop();
+        return "DDR memory bandwidth & integrity stress STOPPED.";
+    }
+    if (cpu_burn_cores.empty()) rebuild_cpu_burn_list();
+    ddr_tester.start(cpu_burn_cores);
+    if (ddr_tester.active.load()) {
+        return "DDR memory stress STARTED: " + ddr_tester.get_status_detail() + " NEON bit-flip verify.";
+    }
+    return "DDR stress unavailable: " + ddr_tester.get_status_detail();
+}
+
 std::string RkTesterEngine::toggle_all_stress() {
+    auto stop_soc_parallel = [&]() {
+        std::vector<pid_t> pids;
+        if (gpu_pid > 0) pids.push_back(gpu_pid);
+        for (pid_t p : npu_pids) { if (p > 0) pids.push_back(p); }
+        if (rga_pid > 0) pids.push_back(rga_pid);
+        if (mpp_pid > 0) pids.push_back(mpp_pid);
+        pid_t ddr_p = ddr_tester.get_pid();
+        if (ddr_p > 0) pids.push_back(ddr_p);
+
+        for (pid_t p : pids) kill(-p, SIGTERM);
+        cpu_stress.store(false);
+        struct sched_param sp{};
+        sp.sched_priority = 0;
+        for (auto& t : cpu_threads) {
+            if (t.joinable()) pthread_setschedparam(t.native_handle(), SCHED_OTHER, &sp);
+        }
+
+        // 并行回收全部子进程（总超时预算 250ms，杜绝逐个串行 4x400ms 卡顿）
+        for (int i = 0; i < 50 && !pids.empty(); ++i) {
+            for (auto it = pids.begin(); it != pids.end();) {
+                if (waitpid(*it, nullptr, WNOHANG) == *it) it = pids.erase(it);
+                else ++it;
+            }
+            if (!pids.empty()) usleep(5000);
+        }
+        for (pid_t p : pids) {
+            kill(-p, SIGKILL);
+            waitpid(p, nullptr, 0);
+        }
+
+        gpu_pid = 0; gpu_stress.store(false);
+        if (gpu_gov_boosted) { write_text_value(DEVFREQ_GPU + "/governor", saved_gpu_gov); gpu_gov_boosted = false; }
+        npu_pids.clear(); npu_stress.store(false);
+        if (npu_gov_boosted) { write_text_value(DEVFREQ_NPU + "/governor", saved_npu_gov); npu_gov_boosted = false; }
+        rga_pid = 0; rga_stress.store(false);
+        mpp_pid = 0; mpp_stress.store(false);
+        if (ddr_p > 0 || ddr_tester.active.load()) ddr_tester.notify_reaped();
+
+        for (auto& t : cpu_threads) {
+            if (t.joinable()) t.join();
+        }
+        cpu_threads.clear();
+    };
+
     bool any_on = cpu_stress.load() || gpu_stress.load() || npu_stress.load() ||
-                  rga_stress.load() || mpp_stress.load();
+                  rga_stress.load() || mpp_stress.load() || ddr_tester.active.load();
     bool all_on = cpu_stress.load() && gpu_stress.load() && npu_stress.load() &&
-                  rga_stress.load() && mpp_stress.load();
+                  rga_stress.load() && mpp_stress.load() && ddr_tester.active.load();
     if (all_on) {
-        if (cpu_stress.load()) toggle_cpu_stress();
-        if (gpu_stress.load()) (void)toggle_gpu_stress();
-        if (npu_stress.load()) (void)toggle_npu_stress();
-        if (rga_stress.load()) (void)toggle_rga_stress();
-        if (mpp_stress.load()) (void)toggle_mpp_stress();
-        return "All SoC stress (CPU/GPU/NPU/RGA/MPP) STOPPED.";
+        stop_soc_parallel();
+        return "All SoC+DDR stress (CPU/GPU/NPU/RGA/MPP/DDR) STOPPED.";
     }
     bool started_any = false;
     std::string warn;
-    if (!cpu_stress.load()) {
-        toggle_cpu_stress();
-        started_any = started_any || cpu_stress.load();
-    }
+    // 先 fork 独立子进程，再启动本进程 CPU 多线程，避免 fork 复制页表时争抢 mmap_lock
     if (!gpu_stress.load()) {
         (void)toggle_gpu_stress();
         if (gpu_stress.load()) started_any = true;
@@ -557,29 +615,93 @@ std::string RkTesterEngine::toggle_all_stress() {
         if (mpp_stress.load()) started_any = true;
         else warn += " [MPP N/A]";
     }
+    if (!ddr_tester.active.load()) {
+        (void)toggle_ddr_stress();
+        if (ddr_tester.active.load()) started_any = true;
+        else warn += " [DDR N/A]";
+    }
+    if (!cpu_stress.load()) {
+        toggle_cpu_stress();
+        started_any = started_any || cpu_stress.load();
+    }
     if (!started_any && any_on) {
-        // 可用项已全部运行，再次按 [4] 则统一停止
-        if (cpu_stress.load()) toggle_cpu_stress();
-        if (gpu_stress.load()) (void)toggle_gpu_stress();
-        if (npu_stress.load()) (void)toggle_npu_stress();
-        if (rga_stress.load()) (void)toggle_rga_stress();
-        if (mpp_stress.load()) (void)toggle_mpp_stress();
-        return "All active SoC stress STOPPED.";
+        // 可用项已全部运行，再次按 [4] 则统一并行停止
+        stop_soc_parallel();
+        return "All active SoC+DDR stress STOPPED.";
     }
     if (cpu_stress.load() && gpu_stress.load() && npu_stress.load() &&
-        rga_stress.load() && mpp_stress.load()) {
-        return "ALL STRESS ON: CPU + GPU + NPU + RGA + RKMPP at full load!";
+        rga_stress.load() && mpp_stress.load() && ddr_tester.active.load()) {
+        return "ALL STRESS ON: CPU + GPU + NPU + RGA + RKMPP + DDR at full load!";
     }
-    return "SoC stress ON (available engines active" + warn + ").";
+    return "SoC+DDR stress ON (available engines active" + warn + ").";
 }
 
 void RkTesterEngine::stop_all_stress() {
+    // 阶段 1：向所有子进程和后台线程并行广播停止信号（零阻塞）
     net_emc.active.store(false);
-    if (cpu_stress.load()) toggle_cpu_stress();
-    if (gpu_stress.load()) (void)toggle_gpu_stress();
-    if (npu_stress.load()) (void)toggle_npu_stress();
-    if (rga_stress.load()) (void)toggle_rga_stress();
-    if (mpp_stress.load()) (void)toggle_mpp_stress();
+    rs232.request_stop();
+    rs485.request_stop();
+    can_tester.request_stop();
+    usb_tester.request_stop();
+    cpu_stress.store(false);
+
+    std::vector<pid_t> pids;
+    if (gpu_pid > 0) pids.push_back(gpu_pid);
+    for (pid_t p : npu_pids) { if (p > 0) pids.push_back(p); }
+    if (rga_pid > 0) pids.push_back(rga_pid);
+    if (mpp_pid > 0) pids.push_back(mpp_pid);
+    pid_t ddr_p = ddr_tester.get_pid();
+    if (ddr_p > 0) pids.push_back(ddr_p);
+
+    for (pid_t p : pids) {
+        kill(-p, SIGTERM);
+    }
+
+    // 同步将本进程 SCHED_IDLE CPU 烤机线程提权回 SCHED_OTHER，避免被抢占饿死
+    struct sched_param sp{};
+    sp.sched_priority = 0;
+    for (auto& t : cpu_threads) {
+        if (t.joinable()) pthread_setschedparam(t.native_handle(), SCHED_OTHER, &sp);
+    }
+
+    // 阶段 2：优先并行回收所有硬件压测子进程（总预算 250ms，释放全部高负载 SCHED_OTHER 进程）
+    for (int i = 0; i < 50 && !pids.empty(); ++i) {
+        for (auto it = pids.begin(); it != pids.end();) {
+            if (waitpid(*it, nullptr, WNOHANG) == *it) it = pids.erase(it);
+            else ++it;
+        }
+        if (!pids.empty()) usleep(5000);
+    }
+    for (pid_t p : pids) {
+        kill(-p, SIGKILL);
+        waitpid(p, nullptr, 0);
+    }
+
+    gpu_pid = 0;
+    gpu_stress.store(false);
+    if (gpu_gov_boosted) {
+        write_text_value(DEVFREQ_GPU + "/governor", saved_gpu_gov);
+        gpu_gov_boosted = false;
+    }
+    npu_pids.clear();
+    npu_stress.store(false);
+    if (npu_gov_boosted) {
+        write_text_value(DEVFREQ_NPU + "/governor", saved_npu_gov);
+        npu_gov_boosted = false;
+    }
+    rga_pid = 0;
+    rga_stress.store(false);
+    mpp_pid = 0;
+    mpp_stress.store(false);
+    if (ddr_p > 0 || ddr_tester.active.load()) {
+        ddr_tester.notify_reaped();
+    }
+
+    // 阶段 3：统一回收本进程线程（外设排空窗口已在阶段 2 并行完成，此处几乎瞬时返回）
+    for (auto& t : cpu_threads) {
+        if (t.joinable()) t.join();
+    }
+    cpu_threads.clear();
     rs232.stop();
     rs485.stop();
     can_tester.stop();
@@ -604,35 +726,35 @@ void RkTesterEngine::toggle_governor() {
 }
 
 std::pair<double, std::vector<double>> RkTesterEngine::get_cpu_loads() {
-    std::ifstream stat_file("/proc/stat");
-    if (!stat_file.is_open()) return {smooth_total, smooth_cores};
+    FILE* f = std::fopen("/proc/stat", "r");
+    if (!f) return {smooth_total, smooth_cores};
 
-    std::string line;
     CpuTime cur_total;
     std::vector<CpuTime> cur_cores(num_cores);
-
-    while (std::getline(stat_file, line)) {
-        if (line.rfind("cpu", 0) != 0) break;
-        std::istringstream ss(line);
-        std::string cpu_lbl;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "cpu", 3) != 0) break;
+        char lbl[16]{};
         unsigned long long u = 0, n = 0, s = 0, id = 0, io = 0, ir = 0, so = 0;
-        if (!(ss >> cpu_lbl >> u >> n >> s >> id >> io >> ir >> so)) continue;
+        if (std::sscanf(line, "%15s %llu %llu %llu %llu %llu %llu %llu",
+                        lbl, &u, &n, &s, &id, &io, &ir, &so) < 8) {
+            continue;
+        }
         unsigned long long tot = u + n + s + id + io + ir + so;
         unsigned long long idl = id + io;
 
-        if (cpu_lbl == "cpu") {
+        if (lbl[3] == '\0') {
             cur_total.total = tot;
             cur_total.idle = idl;
-        } else if (cpu_lbl.size() > 3) {
-            try {
-                int c_idx = std::stoi(cpu_lbl.substr(3));
-                if (c_idx >= 0 && c_idx < num_cores) {
-                    cur_cores[c_idx].total = tot;
-                    cur_cores[c_idx].idle = idl;
-                }
-            } catch (...) {}
+        } else if (lbl[3] >= '0' && lbl[3] <= '9') {
+            int c_idx = std::atoi(lbl + 3);
+            if (c_idx >= 0 && c_idx < num_cores) {
+                cur_cores[c_idx].total = tot;
+                cur_cores[c_idx].idle = idl;
+            }
         }
     }
+    std::fclose(f);
 
     double raw_total = 0.0;
     if (prev_total.total > 0 && cur_total.total > prev_total.total) {
@@ -671,96 +793,83 @@ std::pair<double, std::vector<double>> RkTesterEngine::get_cpu_loads() {
 std::vector<int> RkTesterEngine::get_cpu_freqs() const {
     std::vector<int> freqs(num_cores, 0);
     for (int i = 0; i < num_cores; ++i) {
-        std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/scaling_cur_freq";
-        std::ifstream f(path);
-        if (f.is_open()) {
-            int khz = 0;
-            if (f >> khz) freqs[i] = khz / 1000;
-        }
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", i);
+        long long khz = read_ll_file(path, 0);
+        if (khz > 0) freqs[i] = static_cast<int>(khz / 1000);
     }
     return freqs;
 }
 
 std::pair<double, int> RkTesterEngine::get_gpu_stats() const {
     double load = 0.0;
-    int freq_mhz = 0;
-    std::ifstream f(DEVFREQ_GPU + "/load");
-    if (f.is_open()) {
-        std::string s;
-        f >> s;
-        size_t at_pos = s.find('@');
-        if (at_pos != std::string::npos) {
-            try { load = std::stod(s.substr(0, at_pos)); } catch (...) {}
-            size_t hz_pos = s.find("Hz", at_pos);
-            if (hz_pos != std::string::npos) {
-                try {
-                    std::string f_str = s.substr(at_pos + 1, hz_pos - at_pos - 1);
-                    freq_mhz = static_cast<int>(std::stoll(f_str) / 1000000);
-                } catch (...) {}
-            }
+    int load_freq_mhz = 0;
+    FILE* f = std::fopen((DEVFREQ_GPU + "/load").c_str(), "r");
+    if (f) {
+        long long hz = 0;
+        if (std::fscanf(f, "%lf@%lld", &load, &hz) >= 1 && hz > 0) {
+            load_freq_mhz = static_cast<int>(hz / 1000000);
         }
+        std::fclose(f);
     }
-    if (freq_mhz == 0) {
-        std::ifstream cf(DEVFREQ_GPU + "/cur_freq");
-        if (cf.is_open()) {
-            long long hz = 0;
-            if (cf >> hz) freq_mhz = static_cast<int>(hz / 1000000);
-        }
+    // 优先读取真实硬件时钟 clk_gpu，其次读 devfreq/cur_freq，避免温控降频时 devfreq/load 内频率滞后失真
+    int freq_mhz = read_debugfs_clk_mhz(DEBUG_CLK_GPU);
+    if (freq_mhz <= 0) {
+        long long hz = read_ll_file(DEVFREQ_GPU + "/cur_freq", 0);
+        if (hz > 0) freq_mhz = static_cast<int>(hz / 1000000);
     }
+    if (freq_mhz <= 0) freq_mhz = load_freq_mhz;
     return {load, freq_mhz};
 }
 
 std::pair<std::vector<double>, int> RkTesterEngine::get_npu_stats() const {
-    static const std::regex re("Core(\\d+):\\s*(\\d+)%");
     std::vector<double> loads = {0.0, 0.0};
-    int freq_mhz = 0;
-    std::ifstream f(DEBUG_RKNPU_LOAD);
-    if (f.is_open()) {
-        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        auto begin = std::sregex_iterator(content.begin(), content.end(), re);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            int core = std::stoi((*it)[1].str());
-            double val = std::stod((*it)[2].str());
-            if (core >= 0 && core < static_cast<int>(loads.size())) {
-                loads[core] = val;
+    FILE* f = std::fopen(DEBUG_RKNPU_LOAD.c_str(), "r");
+    if (f) {
+        char buf[256]{};
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        buf[n] = '\0';
+        const char* p = buf;
+        while ((p = std::strstr(p, "Core")) != nullptr) {
+            p += 4;
+            char* end1 = nullptr;
+            long core = std::strtol(p, &end1, 10);
+            if (!end1 || end1 == p) continue;
+            const char* colon = std::strchr(end1, ':');
+            if (!colon) break;
+            char* end2 = nullptr;
+            double val = std::strtod(colon + 1, &end2);
+            if (end2 && end2 != colon + 1 && core >= 0 && core < static_cast<long>(loads.size())) {
+                loads[static_cast<size_t>(core)] = val;
             }
+            p = colon + 1;
         }
     }
-    std::ifstream cf(DEVFREQ_NPU + "/cur_freq");
-    if (cf.is_open()) {
-        long long hz = 0;
-        if (cf >> hz) freq_mhz = static_cast<int>(hz / 1000000);
-    }
+    long long hz = read_ll_file(DEVFREQ_NPU + "/cur_freq", 0);
+    int freq_mhz = (hz > 0) ? static_cast<int>(hz / 1000000) : 0;
     return {loads, freq_mhz};
 }
 
 std::pair<std::vector<double>, int> RkTesterEngine::get_rga_stats() const {
     std::vector<double> loads = {0.0, 0.0};
-    std::ifstream f(DEBUG_RKRGA_LOAD);
-    if (f.is_open()) {
-        std::string line;
+    FILE* f = std::fopen(DEBUG_RKRGA_LOAD.c_str(), "r");
+    if (f) {
+        char line[160];
         int cur_idx = -1;
-        while (std::getline(f, line)) {
-            size_t sp = line.find("scheduler[");
-            if (sp != std::string::npos) {
-                try {
-                    cur_idx = std::stoi(line.substr(sp + 10));
-                } catch (...) {
-                    cur_idx = -1;
-                }
+        while (std::fgets(line, sizeof(line), f)) {
+            const char* sp = std::strstr(line, "scheduler[");
+            if (sp) {
+                cur_idx = std::atoi(sp + 10);
                 continue;
             }
-            size_t lp = line.find("load");
-            if (lp != std::string::npos && cur_idx >= 0 && cur_idx < static_cast<int>(loads.size())) {
-                size_t eq = line.find('=', lp);
-                if (eq != std::string::npos) {
-                    try {
-                        loads[cur_idx] = std::stod(line.substr(eq + 1));
-                    } catch (...) {}
-                }
+            const char* lp = std::strstr(line, "load");
+            if (lp && cur_idx >= 0 && cur_idx < static_cast<int>(loads.size())) {
+                const char* eq = std::strchr(lp, '=');
+                if (eq) loads[static_cast<size_t>(cur_idx)] = std::strtod(eq + 1, nullptr);
             }
         }
+        std::fclose(f);
     }
     int freq_mhz = read_debugfs_clk_mhz(DEBUG_CLK_RGA);
     return {loads, freq_mhz};
@@ -818,28 +927,46 @@ std::pair<uint64_t, uint64_t> RkTesterEngine::get_mpp_session_frames() const {
 std::map<std::string, double> RkTesterEngine::get_thermals() const {
     std::map<std::string, double> res;
     for (const auto& kv : thermal_zones) {
-        std::ifstream f(kv.second);
-        if (f.is_open()) {
-            int raw_temp = 0;
-            if (f >> raw_temp) res[kv.first] = raw_temp / 1000.0;
-        }
+        long long raw_temp = read_ll_file(kv.second, -1);
+        if (raw_temp >= 0) res[kv.first] = static_cast<double>(raw_temp) / 1000.0;
     }
     return res;
 }
 
-std::tuple<double, double, double> RkTesterEngine::get_mem_stats() const {
-    std::ifstream f("/proc/meminfo");
-    long long total = 0, avail = 0;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.rfind("MemTotal:", 0) == 0) {
-            std::istringstream ss(line.substr(9));
-            ss >> total;
-        } else if (line.rfind("MemAvailable:", 0) == 0) {
-            std::istringstream ss(line.substr(13));
-            ss >> avail;
+ThermalThrottleState RkTesterEngine::get_throttle_state() const {
+    ThermalThrottleState st;
+    for (const auto& kv : cooling_devs) {
+        long long cur = read_ll_file(kv.second + "/cur_state", 0);
+        long long maxv = read_ll_file(kv.second + "/max_state", 0);
+        if (kv.first.find("cpu0") != std::string::npos) {
+            st.cpu_little = (cur > 0);
+        } else if (kv.first.find("cpu4") != std::string::npos) {
+            st.cpu_big = (cur > 0);
+        } else if (kv.first.find("gpu") != std::string::npos) {
+            st.gpu = (cur > 0);
+            st.gpu_cur = static_cast<int>(cur);
+            st.gpu_max = static_cast<int>(maxv);
+        } else if (kv.first.find("npu") != std::string::npos) {
+            st.npu = (cur > 0);
         }
     }
+    return st;
+}
+
+std::tuple<double, double, double> RkTesterEngine::get_mem_stats() const {
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return {0.0, 0.0, 0.0};
+    long long total = 0, avail = 0;
+    char line[128];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "MemTotal:", 9) == 0) {
+            std::sscanf(line + 9, "%lld", &total);
+        } else if (std::strncmp(line, "MemAvailable:", 13) == 0) {
+            std::sscanf(line + 13, "%lld", &avail);
+            if (total > 0) break;
+        }
+    }
+    std::fclose(f);
     double tot_gb = total / (1024.0 * 1024.0);
     double used_gb = (total - avail) / (1024.0 * 1024.0);
     double pct = (total > 0) ? ((total - avail) * 100.0 / total) : 0.0;
@@ -847,16 +974,20 @@ std::tuple<double, double, double> RkTesterEngine::get_mem_stats() const {
 }
 
 std::string RkTesterEngine::get_uptime() const {
-    std::ifstream f("/proc/uptime");
-    double up = 0;
-    if (f >> up) {
-        long long s = static_cast<long long>(up);
-        int hrs = static_cast<int>(s / 3600);
-        int mins = static_cast<int>((s % 3600) / 60);
-        int secs = static_cast<int>(s % 60);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hrs, mins, secs);
-        return buf;
+    FILE* f = std::fopen("/proc/uptime", "r");
+    if (f) {
+        double up = 0;
+        int ok = std::fscanf(f, "%lf", &up);
+        std::fclose(f);
+        if (ok == 1) {
+            long long s = static_cast<long long>(up);
+            int hrs = static_cast<int>(s / 3600);
+            int mins = static_cast<int>((s % 3600) / 60);
+            int secs = static_cast<int>(s % 60);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hrs, mins, secs);
+            return buf;
+        }
     }
     return "N/A";
 }
@@ -874,13 +1005,55 @@ void RkTesterEngine::init_thermals() {
     for (int i = 0; i < 16; ++i) {
         std::string t_path = "/sys/class/thermal/thermal_zone" + std::to_string(i) + "/type";
         std::string val_path = "/sys/class/thermal/thermal_zone" + std::to_string(i) + "/temp";
-        std::ifstream t_file(t_path);
-        if (!t_file.is_open()) break;
-        std::string name;
-        std::getline(t_file, name);
-        if (!name.empty() && name.back() == '\r') name.pop_back();
+        std::string name = read_text_token(t_path);
+        if (name.empty()) break;
         size_t pos = name.find("-thermal");
         if (pos != std::string::npos) name = name.substr(0, pos);
         thermal_zones[name] = val_path;
     }
+}
+
+void RkTesterEngine::init_cooling_devices() {
+    cooling_devs.clear();
+    for (int i = 0; i < 16; ++i) {
+        std::string base = "/sys/class/thermal/cooling_device" + std::to_string(i);
+        std::string type = read_text_token(base + "/type");
+        if (type.empty()) break;
+        cooling_devs[type] = base;
+    }
+}
+
+void RkTesterEngine::rebuild_cpu_burn_list() {
+    cpu_burn_cores.clear();
+    bool isolated[64]{};
+    if (keep_isolcpus) {
+        std::string iso = read_text_token("/sys/devices/system/cpu/isolated");
+        const char* p = iso.c_str();
+        while (*p) {
+            if (*p < '0' || *p > '9') {
+                ++p;
+                continue;
+            }
+            char* end1 = nullptr;
+            long a = std::strtol(p, &end1, 10);
+            long b = a;
+            if (end1 && *end1 == '-') {
+                char* end2 = nullptr;
+                b = std::strtol(end1 + 1, &end2, 10);
+                p = end2 ? end2 : (end1 + 1);
+            } else {
+                p = end1 ? end1 : (p + 1);
+            }
+            for (long c = a; c <= b && c < 64; ++c) {
+                if (c >= 0) isolated[c] = true;
+            }
+        }
+    }
+    for (int c = 0; c < num_cores && c < 64; ++c) {
+        if (!isolated[c]) cpu_burn_cores.push_back(c);
+    }
+    if (cpu_burn_cores.empty()) {
+        for (int c = 0; c < num_cores; ++c) cpu_burn_cores.push_back(c);
+    }
+    target_cpu_cores = static_cast<int>(cpu_burn_cores.size());
 }

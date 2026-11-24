@@ -2,14 +2,29 @@
 #include "can_tester.hpp"
 #include "common.hpp"
 #include "config_store.hpp"
+#include "ddr_tester.hpp"
 #include "serial_tester.hpp"
 #include "soc_engine.hpp"
 #include "tui.hpp"
 
 #include <clocale>
 #include <csignal>
+#include <cstdlib>
 #include <string>
 #include <unistd.h>
+
+namespace {
+
+void install_worker_signals() {
+    struct sigaction sa{};
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // 不设 SA_RESTART，确保 SIGTERM 立即打断阻塞系统调用
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     setlocale(LC_ALL, "");
@@ -17,28 +32,33 @@ int main(int argc, char* argv[]) {
     // 先解析命令行参数（确保 --help 零副作用且无需 root 权限）
     bool start_in_menu = false;
     bool no_restore = false;
+    bool keep_isolcpus = false;
     bool cli_rs232_dir = false, cli_rs485_dir = false, cli_can_dir = false;
+    bool cli_lan_hl = false, cli_can_fd = false;
+    bool init_lan_hl = false, init_can_fd = false;
     SerialDirection init_rs232_dir = SerialDirection::A_TO_B;
     SerialDirection init_rs485_dir = SerialDirection::A_TO_B;
     CanDirection init_can_dir = CanDirection::CAN0_TO_CAN1;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--internal-gpu-burn") {
-            signal(SIGTERM, sig_handler);
-            signal(SIGINT, sig_handler);
+            install_worker_signals();
             return run_internal_gpu_burn();
         } else if (arg == "--internal-npu-burn") {
-            signal(SIGTERM, sig_handler);
-            signal(SIGINT, sig_handler);
+            install_worker_signals();
             return run_internal_npu_matmul_burn();
         } else if (arg == "--internal-rga-burn") {
-            signal(SIGTERM, sig_handler);
-            signal(SIGINT, sig_handler);
+            install_worker_signals();
             return run_internal_rga_burn();
         } else if (arg == "--internal-mpp-burn") {
-            signal(SIGTERM, sig_handler);
-            signal(SIGINT, sig_handler);
+            install_worker_signals();
             return run_internal_mpp_burn();
+        } else if (arg == "--internal-ddr-burn") {
+            install_worker_signals();
+            int shm_fd = (i + 1 < argc) ? std::atoi(argv[i + 1]) : -1;
+            uint64_t total_mb = (i + 2 < argc) ? std::strtoull(argv[i + 2], nullptr, 10) : 0;
+            std::string cores_csv = (i + 3 < argc) ? argv[i + 3] : "";
+            return run_internal_ddr_burn(shm_fd, total_mb, cores_csv);
         } else if (arg == "-h" || arg == "--help") {
             print_usage();
             return 0;
@@ -46,6 +66,8 @@ int main(int argc, char* argv[]) {
             start_in_menu = true;
         } else if (arg == "--no-restore") {
             no_restore = true;
+        } else if (arg == "--keep-isolcpus") {
+            keep_isolcpus = true;
         } else if (arg == "--rs232-0to1") {
             init_rs232_dir = SerialDirection::A_TO_B; cli_rs232_dir = true;
         } else if (arg == "--rs232-1to0") {
@@ -64,6 +86,10 @@ int main(int argc, char* argv[]) {
             init_can_dir = CanDirection::CAN1_TO_CAN0; cli_can_dir = true;
         } else if (arg == "--can-pingpong") {
             init_can_dir = CanDirection::PING_PONG; cli_can_dir = true;
+        } else if (arg == "--lan-highload") {
+            init_lan_hl = true; cli_lan_hl = true;
+        } else if (arg == "--can-fd") {
+            init_can_fd = true; cli_can_fd = true;
         }
     }
 
@@ -80,12 +106,19 @@ int main(int argc, char* argv[]) {
     SavedConfig saved_cfg = no_restore ? SavedConfig{} : load_config(cfg_path);
 
     RkTesterEngine engine;
+    if (keep_isolcpus) {
+        engine.set_keep_isolcpus(true);
+    }
     engine.rs232.set_direction(cli_rs232_dir ? init_rs232_dir
                                              : (saved_cfg.loaded ? saved_cfg.rs232_dir : init_rs232_dir));
     engine.rs485.set_direction(cli_rs485_dir ? init_rs485_dir
                                              : (saved_cfg.loaded ? saved_cfg.rs485_dir : init_rs485_dir));
     engine.can_tester.set_direction(cli_can_dir ? init_can_dir
                                                 : (saved_cfg.loaded ? saved_cfg.can_dir : init_can_dir));
+    engine.net_emc.set_high_load(cli_lan_hl ? init_lan_hl
+                                            : (saved_cfg.loaded ? saved_cfg.lan_highload : false));
+    engine.can_tester.set_fd_mode(cli_can_fd ? init_can_fd
+                                             : (saved_cfg.loaded ? saved_cfg.can_fd : false));
 
     if (saved_cfg.loaded) {
         for (size_t i = 0; i < 4; ++i) {
@@ -121,14 +154,15 @@ int main(int argc, char* argv[]) {
         ui.apply_menu(engine);
         int active_cnt = (engine.cpu_stress.load() ? 1 : 0) + (engine.gpu_stress.load() ? 1 : 0) +
                          (engine.npu_stress.load() ? 1 : 0) + (engine.rga_stress.load() ? 1 : 0) +
-                         (engine.mpp_stress.load() ? 1 : 0) + (engine.net_emc.active.load() ? 1 : 0) +
+                         (engine.mpp_stress.load() ? 1 : 0) + (engine.ddr_tester.active.load() ? 1 : 0) +
+                         (engine.net_emc.active.load() ? 1 : 0) +
                          (engine.rs232.active.load() ? 1 : 0) + (engine.rs485.active.load() ? 1 : 0) +
                          (engine.usb_tester.active.load() ? 1 : 0) + (engine.can_tester.active.load() ? 1 : 0);
         if (ui.prompt_status.find("unavailable") == std::string::npos) {
             ui.prompt_status = "Restored last selection: " + std::to_string(active_cnt) + " active (" + cfg_path + ").";
         }
     } else {
-        ui.prompt_status = "Ready. Press [M] Menu, [1-4,0,V] SoC, [5] LAN, [6] 232, [7] 485, [8] USB, [9] CAN.";
+        ui.prompt_status = "Ready. [M]Menu [1-4,0,V,B]SoC/DDR [5/T]LAN [6/7]Ser [8]USB [9/F]CAN.";
     }
 
     run_tui_loop(engine, ui);

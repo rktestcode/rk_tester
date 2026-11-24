@@ -24,6 +24,7 @@ struct UiState {
     double tot_ram{0.0};
     double ram_pct{0.0};
     std::map<std::string, double> thermals;
+    ThermalThrottleState throttle;
     std::string uptime;
     std::string config_path;
 
@@ -34,6 +35,7 @@ struct UiState {
     bool menu_npu{false};
     bool menu_rga{false};
     bool menu_mpp{false};
+    bool menu_ddr{false};
     bool menu_emc{false};
     bool menu_rs232{false};
     bool menu_rs485{false};

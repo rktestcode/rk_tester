@@ -15,11 +15,14 @@ struct SavedConfig {
     bool npu{false};
     bool rga{false};
     bool mpp{false};
+    bool ddr{false};
     bool emc{false};
+    bool lan_highload{false};
     bool rs232{false};
     bool rs485{false};
     bool usb{false};
     bool can{false};
+    bool can_fd{false};
     bool ports[4]{true, true, true, true};
     SerialDirection rs232_dir{SerialDirection::A_TO_B};
     SerialDirection rs485_dir{SerialDirection::A_TO_B};

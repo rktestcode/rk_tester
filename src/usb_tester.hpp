@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -15,6 +16,7 @@ struct UsbDiskInfo {
     std::string label;
 
     mutable std::mutex meta_mtx;
+    std::mutex mount_mtx;
     std::string dev_name;
     std::string part_name;
     std::string fs_type;
@@ -56,6 +58,7 @@ public:
     ~UsbStorageTester();
 
     void start();
+    void request_stop();
     void stop();
     void reset();
 
@@ -68,6 +71,8 @@ public:
 private:
     std::mutex state_mtx;
     std::mutex rebind_mtx;
+    std::mutex monitor_mtx;
+    std::condition_variable monitor_cv;
     std::atomic<bool> shutdown_flag{false};
     std::thread monitor_thread;
 

@@ -30,7 +30,11 @@ UsbStorageTester::UsbStorageTester() {
 
 UsbStorageTester::~UsbStorageTester() {
     stop();
-    shutdown_flag.store(true);
+    {
+        std::lock_guard<std::mutex> lk(monitor_mtx);
+        shutdown_flag.store(true);
+    }
+    monitor_cv.notify_all();
     if (monitor_thread.joinable()) monitor_thread.join();
 }
 
@@ -44,11 +48,15 @@ void UsbStorageTester::start() {
     }
 }
 
+void UsbStorageTester::request_stop() {
+    active.store(false);
+}
+
 void UsbStorageTester::stop() {
     std::vector<std::thread> to_join;
     {
         std::lock_guard<std::mutex> lk(state_mtx);
-        if (!active.load()) return;
+        if (!active.load() && workers.empty()) return;
         active.store(false);
         to_join.swap(workers);
     }
@@ -304,6 +312,7 @@ void UsbStorageTester::lazy_unmount(const std::string& mount_point) {
 }
 
 bool UsbStorageTester::try_mount_disk(UsbDiskInfo& d) {
+    std::lock_guard<std::mutex> mlk(d.mount_mtx);
     std::string dev = find_or_rebind_dev(d);
     if (dev.empty()) {
         std::string mnt_dev, mnt_fs;
@@ -375,21 +384,18 @@ bool UsbStorageTester::try_mount_disk(UsbDiskInfo& d) {
     return false;
 }
 
-// 待机模式后台热插拔巡检线程（绝不阻塞主 TUI 线程，运行压测时自动让权给 worker_loop）
+// 待机模式后台热插拔巡检线程（不持有 state_mtx，绝不阻塞主线程启动/停止 USB 压测）
 void UsbStorageTester::standby_monitor_loop() {
     while (!shutdown_flag.load()) {
-        {
-            std::unique_lock<std::mutex> lk(state_mtx, std::try_to_lock);
-            if (lk.owns_lock() && !active.load()) {
-                for (auto& d : disks) {
-                    if (shutdown_flag.load() || active.load()) break;
-                    try_mount_disk(*d);
-                }
+        if (!active.load()) {
+            for (auto& d : disks) {
+                if (shutdown_flag.load() || active.load()) break;
+                try_mount_disk(*d);
             }
         }
-        for (int i = 0; i < 10 && !shutdown_flag.load(); ++i) {
-            usleep(100000);
-        }
+        std::unique_lock<std::mutex> lk(monitor_mtx);
+        monitor_cv.wait_for(lk, std::chrono::milliseconds(1000),
+                            [this]() { return shutdown_flag.load(); });
     }
 }
 
@@ -411,20 +417,43 @@ void UsbStorageTester::handle_io_failure(UsbDiskInfo& d, const std::string& test
 
 void UsbStorageTester::worker_loop(size_t idx) {
     auto& d = *disks[idx];
-    const size_t BLK_SIZE = 1 * 1024 * 1024; // 1MB test block
-    std::vector<uint8_t> w_buf(BLK_SIZE);
-    std::vector<uint8_t> r_buf(BLK_SIZE);
+    // 4MB 4K对齐数据块 + 持久化文件 + O_DIRECT（不支持 O_DIRECT 的 FUSE 文件系统自动回退 fdatasync+fadvise），
+    // 去除 20ms 人工限速与每轮 open/unlink 元数据开销，充分压榨 USB 3.0 真实读写带宽
+    constexpr size_t BLK_SIZE = 4 * 1024 * 1024;
+    void* raw_w = nullptr;
+    void* raw_r = nullptr;
+    if (posix_memalign(&raw_w, 4096, BLK_SIZE) != 0 || posix_memalign(&raw_r, 4096, BLK_SIZE) != 0 ||
+        !raw_w || !raw_r) {
+        if (raw_w) free(raw_w);
+        if (raw_r) free(raw_r);
+        return;
+    }
+    auto* w_buf = static_cast<uint8_t*>(raw_w);
+    auto* r_buf = static_cast<uint8_t*>(raw_r);
+    auto* w_u32 = reinterpret_cast<uint32_t*>(raw_w);
+    constexpr size_t kWords = BLK_SIZE / sizeof(uint32_t);
 
-    uint32_t seed = static_cast<uint32_t>(idx * 1000 + 1);
+    uint32_t seed = static_cast<uint32_t>(idx * 1000003u + 1u);
     auto last_calc = std::chrono::steady_clock::now();
     uint64_t w_since_calc = 0;
     uint64_t r_since_calc = 0;
     bool was_disconnected = false;
 
     std::string test_file = d.mount_point + "/.rk_test_io_slot" + std::to_string(idx) + ".dat";
+    int io_fd = -1;
+    bool use_direct = false;
+
+    auto close_io_fd = [&]() {
+        if (io_fd >= 0) {
+            close(io_fd);
+            io_fd = -1;
+        }
+        use_direct = false;
+    };
 
     while (active.load()) {
         if (!d.mounted.load()) {
+            close_io_fd();
             d.write_speed_mb.store(0.0);
             d.read_speed_mb.store(0.0);
 
@@ -438,54 +467,69 @@ void UsbStorageTester::worker_loop(size_t idx) {
                 r_since_calc = 0;
             } else {
                 was_disconnected = true;
-                for (int s = 0; s < 5 && active.load(); ++s) usleep(100000);
+                for (int s = 0; s < 25 && active.load(); ++s) usleep(20000);
                 continue;
             }
         }
 
-        for (size_t i = 0; i < BLK_SIZE; i += 4) {
-            uint32_t val = seed + static_cast<uint32_t>(i);
-            std::memcpy(&w_buf[i], &val, 4);
+        if (io_fd < 0) {
+            // 优先 O_DIRECT 零页缓存高速直写/直读；FUSE(ntfs-3g/exfat-fuse) 等不支持时无缝回退
+            io_fd = open(test_file.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_DIRECT, 0666);
+            if (io_fd >= 0) {
+                use_direct = true;
+            } else {
+                io_fd = open(test_file.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+                use_direct = false;
+            }
+            if (io_fd < 0) {
+                handle_io_failure(d, test_file);
+                w_since_calc = 0;
+                r_since_calc = 0;
+                for (int s = 0; s < 15 && active.load(); ++s) usleep(20000);
+                continue;
+            }
         }
-        seed += 17;
 
-        // 1. Write phase
-        int fd = open(test_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0666);
-        if (fd < 0) {
-            handle_io_failure(d, test_file);
-            w_since_calc = 0;
-            r_since_calc = 0;
-            usleep(300000);
-            continue;
+        for (size_t i = 0; i < kWords; ++i) {
+            w_u32[i] = seed + static_cast<uint32_t>(i * 2654435761u);
         }
+        seed += 1013904223u;
 
+        // 1. Write phase (pwrite offset 0，每次 1MB 切片兼顾 4MB 连续吞吐与快速响应退出)
+        constexpr size_t kIoSlice = 1024 * 1024;
         size_t written = 0;
         bool write_err = false;
         while (written < BLK_SIZE && active.load()) {
-            ssize_t w = write(fd, w_buf.data() + written, BLK_SIZE - written);
+            size_t chunk = std::min(kIoSlice, BLK_SIZE - written);
+            ssize_t w = pwrite(io_fd, w_buf + written, chunk, static_cast<off_t>(written));
             if (w <= 0) {
                 if (w < 0 && errno == EINTR) continue;
+                // 若文件系统中途拒绝 O_DIRECT (EINVAL)，切回缓冲模式重试一次
+                if (w < 0 && errno == EINVAL && use_direct && written == 0) {
+                    close_io_fd();
+                    io_fd = open(test_file.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+                    if (io_fd >= 0) continue;
+                }
                 write_err = true;
                 break;
             }
             written += static_cast<size_t>(w);
         }
-        if (written == BLK_SIZE && !write_err) {
-            if (fdatasync(fd) < 0) {
+        if (written == BLK_SIZE && !write_err && !use_direct && active.load()) {
+            if (fdatasync(io_fd) < 0) {
                 write_err = true;
             } else {
-                // 驱逐页缓存，确保后续读阶段真实从 USB 硬件介质读取
-                posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                posix_fadvise(io_fd, 0, static_cast<off_t>(BLK_SIZE), POSIX_FADV_DONTNEED);
             }
         }
-        close(fd);
 
         if (!active.load()) break;
         if (write_err || written < BLK_SIZE) {
+            close_io_fd();
             handle_io_failure(d, test_file);
             w_since_calc = 0;
             r_since_calc = 0;
-            usleep(300000);
+            for (int s = 0; s < 15 && active.load(); ++s) usleep(20000);
             continue;
         }
 
@@ -493,21 +537,15 @@ void UsbStorageTester::worker_loop(size_t idx) {
         d.write_ops.fetch_add(1);
         w_since_calc += written;
 
-        // 2. Read phase (强制绕过页缓存真实读取 USB 设备)
-        int rfd = open(test_file.c_str(), O_RDONLY | O_CLOEXEC);
-        if (rfd < 0) {
-            handle_io_failure(d, test_file);
-            w_since_calc = 0;
-            r_since_calc = 0;
-            usleep(300000);
-            continue;
+        // 2. Read phase (pread offset 0，绕过页缓存真实从 USB 介质回读)
+        if (!use_direct) {
+            posix_fadvise(io_fd, 0, static_cast<off_t>(BLK_SIZE), POSIX_FADV_DONTNEED);
         }
-        posix_fadvise(rfd, 0, 0, POSIX_FADV_DONTNEED);
-
         size_t read_bytes = 0;
         bool read_err = false;
         while (read_bytes < BLK_SIZE && active.load()) {
-            ssize_t r = read(rfd, r_buf.data() + read_bytes, BLK_SIZE - read_bytes);
+            size_t chunk = std::min(kIoSlice, BLK_SIZE - read_bytes);
+            ssize_t r = pread(io_fd, r_buf + read_bytes, chunk, static_cast<off_t>(read_bytes));
             if (r <= 0) {
                 if (r < 0 && errno == EINTR) continue;
                 read_err = true;
@@ -515,15 +553,17 @@ void UsbStorageTester::worker_loop(size_t idx) {
             }
             read_bytes += static_cast<size_t>(r);
         }
-        posix_fadvise(rfd, 0, 0, POSIX_FADV_DONTNEED);
-        close(rfd);
+        if (!use_direct && io_fd >= 0) {
+            posix_fadvise(io_fd, 0, static_cast<off_t>(BLK_SIZE), POSIX_FADV_DONTNEED);
+        }
 
         if (!active.load()) break;
         if (read_err || read_bytes < BLK_SIZE) {
+            close_io_fd();
             handle_io_failure(d, test_file);
             w_since_calc = 0;
             r_since_calc = 0;
-            usleep(300000);
+            for (int s = 0; s < 15 && active.load(); ++s) usleep(20000);
             continue;
         }
 
@@ -531,12 +571,10 @@ void UsbStorageTester::worker_loop(size_t idx) {
         d.read_ops.fetch_add(1);
         r_since_calc += read_bytes;
 
-        // 3. Verify data integrity
-        if (std::memcmp(w_buf.data(), r_buf.data(), BLK_SIZE) != 0) {
+        // 3. Verify 4MB data integrity
+        if (std::memcmp(w_buf, r_buf, BLK_SIZE) != 0) {
             if (active.load()) d.errors.fetch_add(1);
         }
-
-        unlink(test_file.c_str());
 
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_calc).count() / 1000.0;
@@ -549,11 +587,12 @@ void UsbStorageTester::worker_loop(size_t idx) {
             w_since_calc = 0;
             r_since_calc = 0;
         }
-
-        usleep(20000);
     }
 
+    close_io_fd();
     unlink(test_file.c_str());
+    free(raw_w);
+    free(raw_r);
     d.write_speed_mb.store(0.0);
     d.read_speed_mb.store(0.0);
 }

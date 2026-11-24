@@ -1,6 +1,7 @@
 #pragma once
 
 #include "can_tester.hpp"
+#include "ddr_tester.hpp"
 #include "net_emc.hpp"
 #include "serial_tester.hpp"
 #include "usb_tester.hpp"
@@ -29,6 +30,16 @@ struct MppStats {
     uint64_t dec_total{0};
 };
 
+struct ThermalThrottleState {
+    bool cpu_little{false};
+    bool cpu_big{false};
+    bool gpu{false};
+    bool npu{false};
+    int gpu_cur{0};
+    int gpu_max{0};
+    bool any() const { return cpu_little || cpu_big || gpu || npu; }
+};
+
 class RkTesterEngine {
 public:
     int num_cores{8};
@@ -38,6 +49,7 @@ public:
     double smooth_total{0.0};
     bool cpu_initialized{false};
     std::map<std::string, std::string> thermal_zones;
+    std::map<std::string, std::string> cooling_devs;
 
     // 压测状态
     std::atomic<bool> cpu_stress{false};
@@ -46,6 +58,8 @@ public:
     std::atomic<bool> rga_stress{false};
     std::atomic<bool> mpp_stress{false};
     int target_cpu_cores{8};
+    bool keep_isolcpus{false};
+    std::vector<int> cpu_burn_cores;
     bool governor_perf{false};
     std::string saved_gpu_gov{"simple_ondemand"};
     std::string saved_npu_gov{"rknpu_ondemand"};
@@ -67,6 +81,9 @@ public:
     bool mpp_irq_initialized{false};
     double smooth_mpp_enc_fps{0.0};
     double smooth_mpp_dec_fps{0.0};
+
+    // 大容量 DDR 带宽与位翻转完整性校验压测
+    DdrStressTester ddr_tester;
 
     // 4 路千兆网卡 EMC 丢包监测引擎
     NetEmcTester net_emc;
@@ -96,12 +113,15 @@ public:
     void setup_default_network();
 
     void reset_all_stats();
+    void set_keep_isolcpus(bool keep);
+    int get_active_cpu_burn_cores() const;
 
     void toggle_cpu_stress();
     std::string toggle_gpu_stress();
     std::string toggle_npu_stress();
     std::string toggle_rga_stress();
     std::string toggle_mpp_stress();
+    std::string toggle_ddr_stress();
     std::string toggle_all_stress();
     std::string check_stress_health();
     void stop_all_stress();
@@ -115,10 +135,13 @@ public:
     MppStats get_mpp_stats();
     std::pair<uint64_t, uint64_t> get_mpp_session_frames() const;
     std::map<std::string, double> get_thermals() const;
+    ThermalThrottleState get_throttle_state() const;
     std::tuple<double, double, double> get_mem_stats() const;
     std::string get_uptime() const;
 
 private:
     void init_governor_state();
     void init_thermals();
+    void init_cooling_devices();
+    void rebuild_cpu_burn_list();
 };

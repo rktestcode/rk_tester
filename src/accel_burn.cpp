@@ -153,27 +153,31 @@ constexpr int kMppErrTimeout = -8;
 
 void fill_nv12_pattern(uint8_t* ptr, int w, int h, int phase) {
     if (!ptr) return;
-    // 生成高复杂度棋盘+渐变+动态偏移纹理，最大化 H.265 运动估计与 CABAC 硬件计算负载
+    // 生成逼真的高运动 4K 宏块棋盘 + 渐变条纹纹理：
+    // 充分压榨 RKVENC2 运动估计/变换/CABAC 与 RKVDEC2 4K 像素流水线，
+    // 同时避免不可压缩的逐像素白噪声导致单帧码流暴涨、拖累软解析 CPU
+    int shift_x = phase * 48;
+    int shift_y = phase * 32;
     for (int y = 0; y < h; ++y) {
         uint8_t* row = ptr + static_cast<size_t>(y) * w;
-        int by = ((y + phase * 37) >> 4);
-        for (int x = 0; x < w; x += 16) {
-            int bx = ((x + phase * 53) >> 4);
-            uint8_t base = static_cast<uint8_t>(((bx ^ by) * 29 + phase * 61 + (y & 15) * 9) & 0xFF);
-            for (int k = 0; k < 16 && (x + k) < w; ++k) {
-                row[x + k] = static_cast<uint8_t>(base ^ (k * 13 + (y & 7) * 7));
-            }
+        int by = ((y + shift_y) >> 5);
+        int ly = (y + shift_y) & 31;
+        for (int x = 0; x < w; x += 32) {
+            int bx = ((x + shift_x) >> 5);
+            uint8_t base = static_cast<uint8_t>((((bx ^ by) & 7) * 28 + ly * 2 + phase * 19) & 0xFF);
+            int span = (x + 32 <= w) ? 32 : (w - x);
+            std::memset(row + x, base, static_cast<size_t>(span));
         }
     }
     uint8_t* uv = ptr + static_cast<size_t>(w) * h;
     int uv_h = h / 2;
     for (int y = 0; y < uv_h; ++y) {
         uint8_t* row = uv + static_cast<size_t>(y) * w;
-        uint8_t uval = static_cast<uint8_t>((64 + ((y + phase * 23) & 127)) & 0xFF);
-        uint8_t vval = static_cast<uint8_t>((192 - ((y + phase * 31) & 127)) & 0xFF);
+        uint8_t uval = static_cast<uint8_t>(64 + (((y + phase * 24) >> 2) & 127));
+        uint8_t vval = static_cast<uint8_t>(192 - (((y + phase * 20) >> 2) & 127));
         for (int x = 0; x < w; x += 2) {
-            row[x] = static_cast<uint8_t>(uval ^ ((x >> 4) & 31));
-            row[x + 1] = static_cast<uint8_t>(vval ^ ((x >> 3) & 31));
+            row[x] = uval;
+            row[x + 1] = vval;
         }
     }
 }
@@ -224,6 +228,8 @@ int run_internal_gpu_burn() {
     auto pGetAttrib = reinterpret_cast<GLint(*)(GLuint, const char*)>(dlsym(lib_gl, "glGetAttribLocation"));
     auto pGetUniform = reinterpret_cast<GLint(*)(GLuint, const char*)>(dlsym(lib_gl, "glGetUniformLocation"));
     auto pUniform1f = reinterpret_cast<void(*)(GLint, float)>(dlsym(lib_gl, "glUniform1f"));
+    auto pUniform1i = reinterpret_cast<void(*)(GLint, GLint)>(dlsym(lib_gl, "glUniform1i"));
+    auto pActiveTex = reinterpret_cast<void(*)(GLenum)>(dlsym(lib_gl, "glActiveTexture"));
     auto pGenFB = reinterpret_cast<void(*)(GLsizei, GLuint*)>(dlsym(lib_gl, "glGenFramebuffers"));
     auto pBindFB = reinterpret_cast<void(*)(GLenum, GLuint)>(dlsym(lib_gl, "glBindFramebuffer"));
     auto pGenTex = reinterpret_cast<void(*)(GLsizei, GLuint*)>(dlsym(lib_gl, "glGenTextures"));
@@ -238,16 +244,17 @@ int run_internal_gpu_burn() {
     auto pVAPtr = reinterpret_cast<void(*)(GLuint, GLint, GLenum, uint8_t, GLsizei, const void*)>(dlsym(lib_gl, "glVertexAttribPointer"));
     auto pViewport = reinterpret_cast<void(*)(GLint, GLint, GLsizei, GLsizei)>(dlsym(lib_gl, "glViewport"));
     auto pDrawArrays = reinterpret_cast<void(*)(GLenum, GLint, GLsizei)>(dlsym(lib_gl, "glDrawArrays"));
+    auto pFlush = reinterpret_cast<void(*)()>(dlsym(lib_gl, "glFlush"));
     auto pFinish = reinterpret_cast<void(*)()>(dlsym(lib_gl, "glFinish"));
 
     if (!pGbmCreate || !pGbmDestroy || (!pEglGetPlatDpy && !pEglGetDpy) || !pEglInit || !pEglBindApi ||
         !pEglChooseCfg || !pEglCreateCtx || !pEglMakeCur || !pEglTerm ||
         !pCreateShader || !pShaderSrc || !pCompileShader || !pGetShaderiv ||
         !pCreateProg || !pAttachShader || !pLinkProg || !pGetProgiv || !pUseProg ||
-        !pGetAttrib || !pGetUniform || !pUniform1f || !pGenFB || !pBindFB ||
-        !pGenTex || !pBindTex || !pTexParam || !pTexImg2D || !pFBTex2D ||
+        !pGetAttrib || !pGetUniform || !pUniform1f || !pUniform1i || !pActiveTex ||
+        !pGenFB || !pBindFB || !pGenTex || !pBindTex || !pTexParam || !pTexImg2D || !pFBTex2D ||
         !pGenBuf || !pBindBuf || !pBufData || !pEnableVA || !pVAPtr ||
-        !pViewport || !pDrawArrays || !pFinish) {
+        !pViewport || !pDrawArrays || !pFlush || !pFinish) {
         return 21;
     }
 
@@ -333,12 +340,18 @@ int run_internal_gpu_burn() {
         "precision highp float;"
         "varying vec2 vUv;"
         "uniform float uPhase;"
+        "uniform sampler2D uTex;"
         "void main() {"
-        "  vec4 a = vec4(vUv.x + 0.37, vUv.y + 0.61, uPhase + 0.23, 0.89);"
+        "  vec2 off = vec2(uPhase * 0.13, uPhase * 0.17);"
+        "  vec4 s0 = texture2D(uTex, vUv + off);"
+        "  vec4 s1 = texture2D(uTex, vUv * 1.37 - off.yx);"
+        "  vec4 s2 = texture2D(uTex, vUv.yx * 0.83 + vec2(off.y, -off.x));"
+        "  vec4 s3 = texture2D(uTex, vUv * 1.91 + off * 0.5);"
+        "  vec4 a = (s0 + s1 + s2 + s3) * 0.25 + vec4(vUv.x + 0.21, vUv.y + 0.33, uPhase + 0.19, 0.57);"
         "  vec4 b = vec4(0.7519, 0.7523, 0.7517, 0.7521);"
         "  vec4 c = vec4(0.3712, 0.4198, 0.3356, 0.4512);"
         "  vec4 d = vec4(1.8734, 1.7923, 1.9145, 1.7456);"
-        "  for (int i = 0; i < 384; ++i) {"
+        "  for (int i = 0; i < 160; ++i) {"
         "    a = a * b + c;"
         "    a = d - a * b;"
         "  }"
@@ -366,17 +379,37 @@ int run_internal_gpu_burn() {
     if (!ok) return 30;
     pUseProg(prog);
 
-    // 1024x1024 离屏 FBO（100 万像素 x 384 次双 vec4 FMA/帧，直接将 Mali-G52 推至 100% 满频）
+    // 双 1024x1024 RGBA 离屏 FBO 乒乓渲染（4 路双线性纹理采样 + 160 次双 vec4 FMA/帧），
+    // 同时压榨 Mali-G52 的 ALU + Texture Unit + L2/DDR 带宽，且将单次 Job 耗时控制在 ~20-40ms，
+    // 即使温控降频至 300MHz 仍远低于 Panfrost 500ms 硬件超时线
     constexpr GLsizei kDim = 1024;
-    GLuint tex = 0, fbo = 0, vbo = 0;
-    pGenTex(1, &tex);
-    pBindTex(0x0DE1, tex);
-    pTexParam(0x0DE1, 0x2801, 0x2600);
-    pTexParam(0x0DE1, 0x2800, 0x2600);
-    pTexImg2D(0x0DE1, 0, 0x1908, kDim, kDim, 0, 0x1908, 0x1401, nullptr);
-    pGenFB(1, &fbo);
-    pBindFB(0x8D40, fbo);
-    pFBTex2D(0x8D40, 0x8CE0, 0x0DE1, tex, 0);
+    std::vector<uint32_t> init_px(static_cast<size_t>(kDim) * kDim);
+    uint32_t rng = 0x9E3779B9u;
+    for (auto& px : init_px) {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        px = rng | 0xFF000000u;
+    }
+
+    GLuint tex[2]{0, 0};
+    GLuint fbo[2]{0, 0};
+    GLuint vbo = 0;
+    pGenTex(2, tex);
+    pGenFB(2, fbo);
+    pActiveTex(0x84C0); // GL_TEXTURE0
+    for (int i = 0; i < 2; ++i) {
+        pBindTex(0x0DE1, tex[i]);
+        pTexParam(0x0DE1, 0x2801, 0x2601); // GL_TEXTURE_MIN_FILTER = GL_LINEAR
+        pTexParam(0x0DE1, 0x2800, 0x2601); // GL_TEXTURE_MAG_FILTER = GL_LINEAR
+        pTexParam(0x0DE1, 0x2802, 0x2901); // GL_TEXTURE_WRAP_S = GL_REPEAT
+        pTexParam(0x0DE1, 0x2803, 0x2901); // GL_TEXTURE_WRAP_T = GL_REPEAT
+        pTexImg2D(0x0DE1, 0, 0x1908, kDim, kDim, 0, 0x1908, 0x1401, init_px.data());
+        pBindFB(0x8D40, fbo[i]);
+        pFBTex2D(0x8D40, 0x8CE0, 0x0DE1, tex[i], 0);
+    }
+    init_px.clear();
+    init_px.shrink_to_fit();
 
     static const float quad[12] = {
         -1.0f, -1.0f,  1.0f, -1.0f,  -1.0f,  1.0f,
@@ -387,17 +420,25 @@ int run_internal_gpu_burn() {
     pBufData(0x8892, sizeof(quad), quad, 0x88E4);
     GLint pos_loc = pGetAttrib(prog, "aPos");
     GLint phase_loc = pGetUniform(prog, "uPhase");
+    GLint tex_loc = pGetUniform(prog, "uTex");
+    if (tex_loc >= 0) pUniform1i(tex_loc, 0);
     if (pos_loc >= 0) {
         pEnableVA(static_cast<GLuint>(pos_loc));
         pVAPtr(static_cast<GLuint>(pos_loc), 2, 0x1406, 0, 0, nullptr);
     }
     pViewport(0, 0, kDim, kDim);
 
+    int cur = 0;
     float phase = 0.1f;
     while (!g_quit_flag) {
-        for (int r = 0; r < 4; ++r) {
+        for (int r = 0; r < 2; ++r) {
+            int src = 1 - cur;
+            pBindFB(0x8D40, fbo[cur]);
+            pBindTex(0x0DE1, tex[src]);
             if (phase_loc >= 0) pUniform1f(phase_loc, phase);
             pDrawArrays(0x0004, 0, 6);
+            if (r == 0) pFlush();
+            cur = src;
             phase += 0.013f;
             if (phase > 1.0f) phase -= 1.0f;
         }
@@ -455,11 +496,12 @@ int run_internal_npu_matmul_burn() {
     auto pCreate = reinterpret_cast<int(*)(RknnCtx*, RknnMatmulInfo*, RknnMatmulIoAttr*)>(dlsym(lib, "rknn_matmul_create"));
     auto pSetCore = reinterpret_cast<int(*)(RknnCtx, int)>(dlsym(lib, "rknn_matmul_set_core_mask"));
     auto pCreateMem = reinterpret_cast<RknnTensorMem*(*)(RknnCtx, uint32_t)>(dlsym(lib, "rknn_create_mem"));
+    auto pCreateMem2 = reinterpret_cast<RknnTensorMem*(*)(RknnCtx, uint64_t, uint64_t)>(dlsym(lib, "rknn_create_mem2"));
     auto pSetIoMem = reinterpret_cast<int(*)(RknnCtx, RknnTensorMem*, RknnMatmulTensorAttr*)>(dlsym(lib, "rknn_matmul_set_io_mem"));
     auto pRun = reinterpret_cast<int(*)(RknnCtx)>(dlsym(lib, "rknn_matmul_run"));
     auto pDestroyMem = reinterpret_cast<int(*)(RknnCtx, RknnTensorMem*)>(dlsym(lib, "rknn_destroy_mem"));
     auto pDestroy = reinterpret_cast<int(*)(RknnCtx)>(dlsym(lib, "rknn_matmul_destroy"));
-    if (!pCreate || !pCreateMem || !pSetIoMem || !pRun || !pDestroyMem || !pDestroy) return 2;
+    if (!pCreate || (!pCreateMem && !pCreateMem2) || !pSetIoMem || !pRun || !pDestroyMem || !pDestroy) return 2;
 
     std::atomic<bool> failed{false};
     auto npu_worker = [&](int core_mask) {
@@ -474,6 +516,7 @@ int run_internal_npu_matmul_burn() {
         RknnCtx ctx = 0;
         RknnMatmulIoAttr io{};
         bool created = false;
+        int32_t chosen_type = 1;
         for (const auto& sc : cfgs) {
             RknnMatmulInfo info{};
             info.M = sc.M;
@@ -481,6 +524,7 @@ int run_internal_npu_matmul_burn() {
             info.N = sc.N;
             info.type = sc.type;
             if (pCreate(&ctx, &info, &io) == 0) {
+                chosen_type = sc.type;
                 created = true;
                 break;
             }
@@ -491,9 +535,20 @@ int run_internal_npu_matmul_burn() {
         }
         if (pSetCore) pSetCore(ctx, core_mask);
 
-        RknnTensorMem* A = pCreateMem(ctx, io.A.size);
-        RknnTensorMem* B = pCreateMem(ctx, io.B.size);
-        RknnTensorMem* C = pCreateMem(ctx, io.C.size);
+        // 优先使用非缓存 DMA 内存 (RKNN_FLAG_MEMORY_NON_CACHEABLE = 1 << 1)，
+        // 避免每次 rknn_matmul_run() 触发 20MB 的内核 dcache_clean_poc 刷缓存，
+        // 释放大量 CPU 系统态开销并进一步拉满 NPU 双核利用率
+        auto alloc_npu_mem = [&](uint32_t sz) -> RknnTensorMem* {
+            constexpr uint64_t kRknnFlagMemNonCacheable = 1ULL << 1;
+            if (pCreateMem2) {
+                RknnTensorMem* m = pCreateMem2(ctx, sz, kRknnFlagMemNonCacheable);
+                if (m) return m;
+            }
+            return pCreateMem ? pCreateMem(ctx, sz) : nullptr;
+        };
+        RknnTensorMem* A = alloc_npu_mem(io.A.size);
+        RknnTensorMem* B = alloc_npu_mem(io.B.size);
+        RknnTensorMem* C = alloc_npu_mem(io.C.size);
         if (!A || !B || !C) {
             if (A) pDestroyMem(ctx, A);
             if (B) pDestroyMem(ctx, B);
@@ -502,8 +557,35 @@ int run_internal_npu_matmul_burn() {
             failed.store(true);
             return;
         }
-        if (A->virt_addr) std::memset(A->virt_addr, 0x3C, io.A.size);
-        if (B->virt_addr) std::memset(B->virt_addr, 0x3C, io.B.size);
+        // 使用确定性伪随机合法数值填充（FP16 范围 ±[0.125, 0.5) 无 NaN/Inf，INT8 范围 [-64, 63]），
+        // 显著提高 NPU MAC 乘加阵列的比特翻转率与真实功耗
+        auto fill_matrix = [&](void* ptr, uint32_t bytes, uint32_t seed) {
+            if (!ptr || bytes == 0) return;
+            uint32_t st = seed;
+            if (chosen_type == 1) {
+                auto* p16 = static_cast<uint16_t*>(ptr);
+                size_t n = bytes / 2;
+                for (size_t i = 0; i < n; ++i) {
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    uint16_t sign = static_cast<uint16_t>((st & 1u) << 15);
+                    uint16_t exp = static_cast<uint16_t>((12u + ((st >> 1) & 1u)) << 10);
+                    uint16_t mant = static_cast<uint16_t>((st >> 2) & 0x3FFu);
+                    p16[i] = static_cast<uint16_t>(sign | exp | mant);
+                }
+            } else {
+                auto* p8 = static_cast<int8_t*>(ptr);
+                for (uint32_t i = 0; i < bytes; ++i) {
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    p8[i] = static_cast<int8_t>(static_cast<int>(st & 0x7Fu) - 64);
+                }
+            }
+        };
+        fill_matrix(A->virt_addr, io.A.size, 0x13579BDFu ^ static_cast<uint32_t>(core_mask * 97));
+        fill_matrix(B->virt_addr, io.B.size, 0x2468ACE1u ^ static_cast<uint32_t>(core_mask * 131));
         pSetIoMem(ctx, A, &io.A);
         pSetIoMem(ctx, B, &io.B);
         pSetIoMem(ctx, C, &io.C);
@@ -730,7 +812,8 @@ int run_internal_mpp_burn() {
     std::atomic<bool> failed{false};
 
     // 工具函数：创建并初始化一个 4K H.265 (回退 H.264) 硬件编码器上下文
-    auto create_encoder = [&](MppCtx& enc_ctx, MppApiTable*& enc_mpi, int& coding_out) -> bool {
+    auto create_encoder = [&](MppCtx& enc_ctx, MppApiTable*& enc_mpi, int& coding_out,
+                              int bps_target, int qp_init, int qp_min) -> bool {
         coding_out = kMppCodingHevc;
         if (pCreate(&enc_ctx, &enc_mpi) != 0 || !enc_ctx || !enc_mpi) return false;
         int64_t enc_timeout = 100;
@@ -757,9 +840,9 @@ int run_internal_mpp_burn() {
         pEncCfgSetS32(ecfg, "prep:ver_stride", kH);
         pEncCfgSetS32(ecfg, "prep:format", kMppFmtYuv420Sp);
         pEncCfgSetS32(ecfg, "rc:mode", kMppRcModeCbr);
-        pEncCfgSetS32(ecfg, "rc:bps_target", 24000000);
-        pEncCfgSetS32(ecfg, "rc:bps_max", 28000000);
-        pEncCfgSetS32(ecfg, "rc:bps_min", 18000000);
+        pEncCfgSetS32(ecfg, "rc:bps_target", bps_target);
+        pEncCfgSetS32(ecfg, "rc:bps_max", bps_target + bps_target / 5);
+        pEncCfgSetS32(ecfg, "rc:bps_min", bps_target - bps_target / 4);
         pEncCfgSetS32(ecfg, "rc:gop", 30);
         pEncCfgSetS32(ecfg, "rc:fps_in_flex", 0);
         pEncCfgSetS32(ecfg, "rc:fps_in_num", 60);
@@ -767,10 +850,10 @@ int run_internal_mpp_burn() {
         pEncCfgSetS32(ecfg, "rc:fps_out_flex", 0);
         pEncCfgSetS32(ecfg, "rc:fps_out_num", 60);
         pEncCfgSetS32(ecfg, "rc:fps_out_denom", 1);
-        pEncCfgSetS32(ecfg, "rc:qp_init", 26);
-        pEncCfgSetS32(ecfg, "rc:qp_min", 10);
+        pEncCfgSetS32(ecfg, "rc:qp_init", qp_init);
+        pEncCfgSetS32(ecfg, "rc:qp_min", qp_min);
         pEncCfgSetS32(ecfg, "rc:qp_max", 51);
-        pEncCfgSetS32(ecfg, "rc:qp_min_i", 10);
+        pEncCfgSetS32(ecfg, "rc:qp_min_i", qp_min);
         pEncCfgSetS32(ecfg, "rc:qp_max_i", 51);
         bool ok = (enc_mpi->control(enc_ctx, kMppCmdEncSetCfg, ecfg) == 0);
         pEncCfgDeinit(ecfg);
@@ -781,14 +864,15 @@ int run_internal_mpp_burn() {
         return ok;
     };
 
-    // 阶段 1：启动时预编码 1 个完整 30 帧 4K H.265 GOP（首帧前拼入 VPS/SPS/PPS 头）
-    // 供解码器完全解耦、零互斥锁、零分帧解析开销（split_parse=0）地满速循环硬件解码
+    // 阶段 1：启动时以 8Mbps 预编码 1 个标准 30 帧 4K H.265 GOP（首帧前拼入 VPS/SPS/PPS 头）
+    // 控制单包体积在合理范围，大幅降低 mpp_dec_parser 软扫描与 DMA 缓存同步 CPU 开销，
+    // 同时让 RKVDEC2 满速解码 3840x2160 像素流水线并输出完整 4K NV12 帧至 DDR
     int dec_coding = kMppCodingHevc;
     std::vector<std::vector<uint8_t>> gop_pkts;
     {
         MppCtx init_enc = nullptr;
         MppApiTable* init_mpi = nullptr;
-        if (create_encoder(init_enc, init_mpi, dec_coding)) {
+        if (create_encoder(init_enc, init_mpi, dec_coding, 8000000, 30, 24)) {
             std::vector<uint8_t> hdr_bytes;
             MppBuffer hdr_buf = nullptr;
             if (pBufGet(shared_grp, &hdr_buf, 65536, "rk_mpp", "hdr") == 0 && hdr_buf) {
@@ -849,7 +933,7 @@ int run_internal_mpp_burn() {
         MppCtx enc_ctx = nullptr;
         MppApiTable* enc_mpi = nullptr;
         int coding = kMppCodingHevc;
-        if (!create_encoder(enc_ctx, enc_mpi, coding)) {
+        if (!create_encoder(enc_ctx, enc_mpi, coding, 24000000, 26, 12)) {
             failed.store(true);
             return;
         }
@@ -929,7 +1013,7 @@ int run_internal_mpp_burn() {
                         pGrpGet(&dec_grp, kMppBufTypeDrm, kMppBufInternal, "rk_mpp", "dec");
                     }
                     if (dec_grp) {
-                        pGrpLimit(dec_grp, bsz, 10);
+                        pGrpLimit(dec_grp, bsz, 16);
                         dec_mpi->control(dec_ctx, kMppCmdDecSetExtBufGroup, dec_grp);
                     }
                     dec_mpi->control(dec_ctx, kMppCmdDecSetInfoChangeReady, nullptr);

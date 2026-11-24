@@ -38,11 +38,14 @@ SavedConfig load_config(const std::string& path) {
         else if (k == "npu") cfg.npu = (iv != 0);
         else if (k == "rga") cfg.rga = (iv != 0);
         else if (k == "mpp") cfg.mpp = (iv != 0);
+        else if (k == "ddr") cfg.ddr = (iv != 0);
         else if (k == "emc") cfg.emc = (iv != 0);
+        else if (k == "lan_highload") cfg.lan_highload = (iv != 0);
         else if (k == "rs232") cfg.rs232 = (iv != 0);
         else if (k == "rs485") cfg.rs485 = (iv != 0);
         else if (k == "usb") cfg.usb = (iv != 0);
         else if (k == "can") cfg.can = (iv != 0);
+        else if (k == "can_fd") cfg.can_fd = (iv != 0);
         else if (k == "lan0") cfg.ports[0] = (iv != 0);
         else if (k == "lan1") cfg.ports[1] = (iv != 0);
         else if (k == "lan2") cfg.ports[2] = (iv != 0);
@@ -66,11 +69,14 @@ bool save_config_snapshot(const std::string& path, const SavedConfig& cfg) {
       << "npu=" << (cfg.npu ? 1 : 0) << "\n"
       << "rga=" << (cfg.rga ? 1 : 0) << "\n"
       << "mpp=" << (cfg.mpp ? 1 : 0) << "\n"
+      << "ddr=" << (cfg.ddr ? 1 : 0) << "\n"
       << "emc=" << (cfg.emc ? 1 : 0) << "\n"
+      << "lan_highload=" << (cfg.lan_highload ? 1 : 0) << "\n"
       << "rs232=" << (cfg.rs232 ? 1 : 0) << "\n"
       << "rs485=" << (cfg.rs485 ? 1 : 0) << "\n"
       << "usb=" << (cfg.usb ? 1 : 0) << "\n"
       << "can=" << (cfg.can ? 1 : 0) << "\n"
+      << "can_fd=" << (cfg.can_fd ? 1 : 0) << "\n"
       << "lan0=" << (cfg.ports[0] ? 1 : 0) << "\n"
       << "lan1=" << (cfg.ports[1] ? 1 : 0) << "\n"
       << "lan2=" << (cfg.ports[2] ? 1 : 0) << "\n"
@@ -96,11 +102,14 @@ void save_engine_config(const RkTesterEngine& engine, const std::string& path) {
     cfg.npu = engine.npu_stress.load();
     cfg.rga = engine.rga_stress.load();
     cfg.mpp = engine.mpp_stress.load();
+    cfg.ddr = engine.ddr_tester.active.load();
     cfg.emc = engine.net_emc.active.load();
+    cfg.lan_highload = engine.net_emc.high_load.load();
     cfg.rs232 = engine.rs232.active.load();
     cfg.rs485 = engine.rs485.active.load();
     cfg.usb = engine.usb_tester.active.load();
     cfg.can = engine.can_tester.active.load();
+    cfg.can_fd = engine.can_tester.fd_mode.load();
     for (int i = 0; i < 4; ++i) cfg.ports[i] = engine.get_port_enabled(static_cast<size_t>(i));
     cfg.rs232_dir = engine.rs232.dir.load();
     cfg.rs485_dir = engine.rs485.dir.load();
